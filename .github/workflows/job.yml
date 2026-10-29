@@ -5,10 +5,23 @@ on:
       task:
         description: job json
         required: true
+concurrency:
+  group: cookie
+  cancel-in-progress: false
+permissions:
+  contents: read
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-      - run: echo "${{ inputs.task }}" > /tmp/task.json && echo ok
+      - name: free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+      - name: deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq aria2 p7zip-full unrar-free
+      - name: job
+        env:
+          TASK: ${{ inputs.task }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: python3 worker.py

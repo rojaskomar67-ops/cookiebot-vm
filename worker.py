@@ -442,12 +442,17 @@ def atype(p):
     except Exception: pass
     return "rar" if Path(p).suffix.lower() in (".rar", ".r00") else "zip"
 
-def nfiles(tool, arc, pwd):
+FILTERS = ("*.txt", "*.log", "*.cookie", "*.cookies")
+
+def nfiles(tool, arc, pwd, filters=None):
     try:
-        if "unrar" in os.path.basename(tool):
+        name = os.path.basename(tool)
+        if "unrar" in name:
             c = [tool, "lb", "-p%s" % pwd if pwd else "-p-", str(arc)]
         else:
             c = [tool, "l", str(arc)] + (["-p%s" % pwd] if pwd else [])
+            if filters:
+                c += ["-i!" + f for f in filters]
         ls = [l for l in run(c).stdout.splitlines() if l.strip()]
         return sum(1 for l in ls if re.search(r"\d{4}-\d{2}-\d{2}", l)) or len(ls) or 1
     except Exception: return 1
@@ -457,27 +462,42 @@ def dstat(p):
     return len(fl), sum(f.stat().st_size for f in fl)
 
 def extract(arc, out, pwds):
+    """Only text files can contain cookies, so extract them first with an include
+    filter (far less I/O on mixed archives); fall back to a full extract."""
+    ok, why = _extract(arc, out, pwds, FILTERS)
+    if not ok and why not in ("wrong_password", "cancelled"):
+        ok, why = _extract(arc, out, pwds, None)
+    return ok, why
+
+def _extract(arc, out, pwds, filters):
     out.mkdir(parents=True, exist_ok=True)
     t = atype(arc)
-    if not shutil.which("7z"): apt(["p7zip-full"])
-    if t == "rar" and not shutil.which("unrar") and not shutil.which("unrar-free"):
+    if not any(shutil.which(x) for x in ("7zz", "7z", "7za")): apt(["p7zip-full"])
+    if t == "rar" and not any(shutil.which(x) for x in ("unrar", "unrar-free", "unar")):
         apt(["unrar-free"])
-    order = (["unrar", "unrar-free", "7z", "7za"] if t == "rar" else ["7z", "7za", "unrar"])
+    # 7zz (7-Zip 23+) decodes RAR5 and is much faster than unrar-free; unar and
+    # unrar stay as fallbacks for archives 7-Zip rejects.
+    order = (["7zz", "7z", "7za", "unrar", "unrar-free", "unar"] if t == "rar"
+             else ["7zz", "7z", "7za", "unar", "unrar", "unrar-free"])
     tools = [p for p in (shutil.which(x) for x in order) if p]
     if not tools:
         st("error", err="no_extractor_on_vm"); return False, "tool_missing"
     badpwd = False
     for tool in tools:
-        tot = nfiles(tool, arc, (pwds or [None])[0])
+        tot = nfiles(tool, arc, (pwds or [None])[0], filters)
         for pwd in (pwds or [None]):
             if stop(): return False, "cancelled"
-            rar = "unrar" in os.path.basename(tool)
-            if rar:
+            name = os.path.basename(tool)
+            if "unrar" in name:
                 cmd = [tool, "x", "-o+", "-y", "-p%s" % pwd if pwd else "-p-",
                        str(arc), str(out).rstrip("/") + "/"]
+            elif name == "unar":
+                cmd = [tool, "-f", "-D", "-o", str(out), str(arc)]
             else:
                 cmd = [tool, "x", str(arc), "-o%s" % out, "-y", "-mmt=%d" % CORES]
                 if pwd: cmd.append("-p%s" % pwd)
+                if filters:
+                    cmd += ["-ir!" + f for f in filters]
             st("extract", 31, engine=os.path.basename(tool), files_total=tot,
                using_password=bool(pwd), threads=CORES, last_file="")
             t0 = time.time()
@@ -556,7 +576,8 @@ def search_pack(ex):
     if tot:
         size = 256          # small chunks: progress + cancellation stay live on huge trees
         chunks = [files[i:i + size] for i in range(0, tot, size)]
-        nw = min(CORES, len(chunks))
+        # parsing is I/O bound, so oversubscribe the cores (2× vCPU, min 4)
+        nw = min(len(chunks), max(4, CORES * 2))
         with ProcessPoolExecutor(max_workers=nw) as ex_pool:
             futs = [ex_pool.submit(scan_chunk, c) for c in chunks]
             scanned = found_c = 0

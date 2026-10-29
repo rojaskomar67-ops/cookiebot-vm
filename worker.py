@@ -514,10 +514,10 @@ def search_pack(ex):
     st("scan", 44, log_files=tot, cores=CORES)
     sess = {d: [] for d in DOMS}; seen = {d: set() for d in DOMS}
     if tot:
-        nw = max(1, min(CORES, tot))
-        chunks = [files[i::nw] for i in range(nw)]
-        chunks = [c for c in chunks if c]
-        with ProcessPoolExecutor(max_workers=len(chunks)) as ex_pool:
+        size = 256          # small chunks: progress + cancellation stay live on huge trees
+        chunks = [files[i:i + size] for i in range(0, tot, size)]
+        nw = min(CORES, len(chunks))
+        with ProcessPoolExecutor(max_workers=nw) as ex_pool:
             futs = [ex_pool.submit(scan_chunk, c) for c in chunks]
             scanned = found_c = 0
             for fut in as_completed(futs):
@@ -532,7 +532,7 @@ def search_pack(ex):
                         found_c += 1
                 tick("scan", 44 + min(scanned * 40 // max(tot, 1), 40),
                      scanned=scanned, log_files=tot, cores=CORES,
-                     workers=len(chunks), sessions=found_c,
+                     workers=nw, sessions=found_c,
                      per_domain={d: len(v) for d, v in sess.items() if v})
     hdr = "# Netscape HTTP Cookie File\n# https://curl.se/docs/http-cookies.html\n\n"
     packed = {}

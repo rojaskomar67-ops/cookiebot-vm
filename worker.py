@@ -319,15 +319,28 @@ def scan_file(path):
     """One log file -> one cookie session {domain: [(name, val, line), ...]}"""
     per_dom = {}
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for raw in f:
-                c = parse_cookie(raw)
-                if not c: continue
-                dom, name, val, fmt = c
-                for d in DOMS:
-                    if d in dom:
-                        per_dom.setdefault(d, []).append((name, val, fmt))
-    except Exception: pass
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except Exception:
+        return per_dom
+    if not data:
+        return per_dom
+    low = data.lower()
+    if DOMS and not any(d.encode() in low for d in DOMS):
+        return per_dom            # cheap reject: the domain never appears in the file
+    try:
+        text = data.decode("utf-8", "ignore")
+    except Exception:
+        return per_dom
+    for raw in text.splitlines():
+        if "\t" not in raw and raw.count(" ") < 6:
+            continue
+        c = parse_cookie(raw)
+        if not c: continue
+        dom, name, val, fmt = c
+        for d in DOMS:
+            if d in dom:
+                per_dom.setdefault(d, []).append((name, val, fmt))
     return per_dom
 
 def scan_chunk(paths):
@@ -468,24 +481,50 @@ def extract(arc, out, pwds):
             st("extract", 31, engine=os.path.basename(tool), files_total=tot,
                using_password=bool(pwd), threads=CORES, last_file="")
             t0 = time.time()
-            pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  text=True, errors="ignore", bufsize=1)
+            # stderr merged into stdout: an undrained stderr pipe deadlocks the
+            # extractor once it warns on 64 KB, which froze big archives mid-run.
+            pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  stdin=subprocess.DEVNULL, text=True,
+                                  errors="ignore", bufsize=1)
             done = 0
             sz = 0
             sz_t = 0.0
+            tail = []
+            act = [time.time()]
+            base_free = shutil.disk_usage(str(out)).free
+
+            def watch(proc=pr, act=act):
+                last_free = shutil.disk_usage(str(out)).free
+                while proc.poll() is None:
+                    time.sleep(10)
+                    try:
+                        cur = shutil.disk_usage(str(out)).free
+                    except Exception:
+                        continue
+                    if cur < last_free - (1 << 20):
+                        last_free, act[0] = cur, time.time()
+                    elif time.time() - act[0] > 600:
+                        proc.kill()
+                        return
+            threading.Thread(target=watch, daemon=True).start()
+
             rx = re.compile(r"^(Extracting|-\s+\S|x\s+\S)", re.I)
             for raw in pr.stdout:
                 if stop():
-                    pr.terminate(); return False, "cancelled"
+                    pr.kill(); return False, "cancelled"
                 line = raw.strip()
+                tail.append(line)
+                if len(tail) > 200: tail.pop(0)
                 if rx.search(line):
                     done += 1
+                    act[0] = time.time()
                     el = time.time() - t0
                     rate = done / el if el > 0 else 0
                     eta = (tot - done) / rate if rate > 0 else 0
                     if time.time() - sz_t >= 2.0:
                         sz_t = time.time()
-                        _n, sz = dstat(out)
+                        try: sz = max(0, base_free - shutil.disk_usage(str(out)).free)
+                        except Exception: pass
                     nm = line.split()[-1] if line else ""
                     tick("extract", 31 + min(done * 12 // max(tot, 1), 12),
                          files=done, files_total=tot, extracted=fs(sz),
@@ -493,10 +532,11 @@ def extract(arc, out, pwds):
                          file_speed="%d f/s" % rate if rate else "-",
                          eta=ft(eta), elapsed=ft(el), last_file=Path(nm).name[:40],
                          core_load=os.getloadavg()[0] if hasattr(os, "getloadavg") else 0)
-            err = (pr.stderr.read() or "").lower(); pr.wait()
-            if pr.returncode == 11 or any(k in err for k in
+            pr.wait()
+            out_txt = "\n".join(tail).lower()
+            if pr.returncode == 11 or any(k in out_txt for k in
                    ("wrong password", "bad password", "corrupt file or wrong password",
-                    "data error in encrypted")):
+                    "data error in encrypted", "enter password")):
                 badpwd = True
                 st("wrong_password", 31, tried=str(pwd)); continue
             n, sz = dstat(out)

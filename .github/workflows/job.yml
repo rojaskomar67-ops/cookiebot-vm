@@ -19,7 +19,7 @@ jobs:
       - name: free disk
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
       - name: deps
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq aria2 p7zip-full unrar-free
+        run: sudo apt-get update -qq && (sudo apt-get install -y -qq aria2 p7zip-full unrar-free || true) && (sudo apt-get install -y -qq 7zip unar || true)
       - name: job
         env:
           TASK: ${{ inputs.task }}

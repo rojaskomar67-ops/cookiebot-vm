@@ -1,0 +1,14 @@
+name: cookie-job
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: job json
+        required: true
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "${{ inputs.task }}" > /tmp/task.json && echo ok

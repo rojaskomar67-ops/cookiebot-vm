@@ -884,11 +884,12 @@ def check_auths(auths):
     MAX_TRY = 3
 
     def run_pass(pending, seed):
-        """One check pass over the pending indexes; False when cancelled."""
+        """One check pass over the pending indexes; False when cancelled.
+        The last pass always drops the proxies and tries the direct route."""
         def one(i):
             rel, path = pairs[i]
             proxy = None
-            if proxies:
+            if proxies and seed < MAX_TRY - 1:
                 proxy = proxies[(seed * 7919 + i) % len(proxies)]
             try:
                 return auth_check_one(rel, path, proxy)
@@ -922,11 +923,16 @@ def check_auths(auths):
             return {}
         pending = [i for i in range(total)
                    if results[i] and results[i]["status"] == "error"]
-    for i, r in enumerate(results):          # defensive: never leave a hole
+    for i, r in enumerate(results):
+        # leftovers after all rounds: classify as unreachable-BAD, no ERROR bucket
         if r is None:
-            results[i] = {"name": pairs[i][0], "status": "error",
-                          "reason": "no result", "email": "-", "plan": "-",
-                          "expires": "-", "proxy": "-", "token": ""}
+            r = {"name": pairs[i][0], "status": "dead", "reason": "no result",
+                 "email": "-", "plan": "-", "expires": "-", "proxy": "-", "token": ""}
+        elif r.get("status") == "error":
+            r["status"] = "dead"
+            r["reason"] = ("unreachable after %d attempts (%s)"
+                           % (MAX_TRY, r.get("reason", "")))
+        results[i] = r
 
     def aline(r):
         return ("File: %s\nEmail: %s | Plan: %s | Exp: %s\n"
@@ -969,6 +975,8 @@ def check_auths(auths):
     try:
         (OUT / "results").mkdir(parents=True, exist_ok=True)
         for fold, rows in fold_of.items():
+            if not rows:
+                continue          # skip empty buckets — no empty folders in the zip
             d = OUT / "results" / fold
             d.mkdir(parents=True, exist_ok=True)
             hits = ""

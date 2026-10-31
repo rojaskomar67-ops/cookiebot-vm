@@ -866,10 +866,24 @@ def check_auths(auths):
     proxies = auth_fetch_proxies()
     if stop():
         return {}
+
+    # search_pack() hands back bare paths; accept (rel, path) pairs too
+    pairs = []
+    for it in auths:
+        if isinstance(it, (tuple, list)):
+            pairs.append((str(it[0]), str(it[1])))
+            continue
+        p = it
+        try:
+            rel = str(p.relative_to(WORK / "ex"))
+        except Exception:
+            rel = p.name
+        pairs.append((rel, str(p)))
+    total = len(pairs)
     results = []
 
     def one(i):
-        rel, path = auths[i]
+        rel, path = pairs[i]
         proxy = proxies[i % len(proxies)] if proxies else None
         try:
             return auth_check_one(rel, path, proxy)
@@ -910,6 +924,7 @@ def check_auths(auths):
     live_set = prem_set + free_set
 
     def wfile(name, rows, head=""):
+        (OUT / "results").mkdir(parents=True, exist_ok=True)
         with open(OUT / name, "w", encoding="utf-8") as f:
             f.write(head)
             for r in rows: f.write(aline(r))
@@ -950,7 +965,7 @@ def check_auths(auths):
     try:
         with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("report.txt", report)
-            for rel, path in auths:
+            for rel, path in pairs:
                 try: z.write(path, "source/" + rel.replace("\\", "_"))
                 except Exception: pass
             for sub in ("premium_hits.txt", "free_hits.txt", "expired.txt",

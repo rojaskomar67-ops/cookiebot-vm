@@ -1,4 +1,4 @@
-import glob, json, os, platform, queue, re, shutil, socket, subprocess, sys, threading, time, zipfile
+import glob, json, multiprocessing, os, platform, queue, re, shutil, socket, subprocess, sys, threading, time, zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -679,7 +679,8 @@ def search_pack(ex, want_auth=True):
         chunks = [files[i:i + size] for i in range(0, tot, size)]
         # parsing is I/O bound, so oversubscribe the cores (2× vCPU, min 4)
         nw = min(len(chunks), max(4, CORES * 2))
-        with ProcessPoolExecutor(max_workers=nw) as ex_pool:
+        mp_ctx = multiprocessing.get_context("fork")
+        with ProcessPoolExecutor(max_workers=nw, mp_context=mp_ctx) as ex_pool:
             futs = [ex_pool.submit(scan_chunk, c) for c in chunks]
             scanned = found_c = 0
             for fut in as_completed(futs):
@@ -1482,4 +1483,5 @@ def main():
     st("queued", 0, job=task.get("job"), vm=SPECS)
     process(task)
 
-main()
+if __name__ == "__main__":
+    main()

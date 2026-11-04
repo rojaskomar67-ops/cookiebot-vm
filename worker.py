@@ -1438,7 +1438,7 @@ def process(task):
             finish(task, "error", err=why)
         return
     shutil.rmtree(WORK / "dl", ignore_errors=True) \
-        if not task.get("tdata") else None
+        if not (task.get("tdata") or task.get("json")) else None
     packed, auths = search_pack(WORK / "ex", bool(task.get("auth")))
     if stop():
         shutil.rmtree(WORK, ignore_errors=True)

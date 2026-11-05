@@ -1306,17 +1306,11 @@ def check_tdata(tdirs):
         return out
     proxies = auth_fetch_proxies()
     out["tk_proxies"] = len(proxies)
-    if not ensure_pkgs():
-        sys.stdout.write("tdcheck: package install failed — aborting cleanly\n")
-        sys.stdout.flush()
-        out["tk_err"] = len(tdirs)
-        tick("tdatacheck", 96, **out)
-        return out
+    sys.stdout.write("tdcheck: %d folders, %d proxies\n"
+                     % (len(tdirs), len(proxies))); sys.stdout.flush()
     tick("tdatacheck", 90, tk_total=out["tk_total"], tk_done=0,
          tk_valid=0, tk_prem=0, tk_2fa=0, tk_frozen=0, tk_dead=0, tk_err=0,
          tk_proxies=len(proxies))
-    sys.stdout.write("tdcheck: %d folders, %d proxies\n"
-                     % (len(tdirs), len(proxies))); sys.stdout.flush()
 
     # opentele turns a tdata folder into a real telethon client; telethon
     # needs python-socks to hop through the HTTP proxies. No VPN, no VM apps —
@@ -1338,6 +1332,12 @@ def check_tdata(tdirs):
             sys.stdout.write("tdcheck: opentele unavailable: %s\n" % e)
             sys.stdout.flush()
             return False
+    if not ensure_pkgs():
+        sys.stdout.write("tdcheck: package install failed — aborting cleanly\n")
+        sys.stdout.flush()
+        out["tk_err"] = len(tdirs)
+        tick("tdatacheck", 96, **out)
+        return out
 
     def parse_proxy(p):
         m = re.match(r"(\w+)://(?:([^:@]+)(?::([^@]*))?@)?([^:/]+)(?::(\d+))?", p)
@@ -1347,9 +1347,59 @@ def check_tdata(tdirs):
         return (scheme.lower() or "http", user, pw, host, int(port or 80))
 
     # state per folder
+    seen = set()
+    dedup = []
+    for d in tdirs:
+        rp = os.path.realpath(str(d))
+        if rp not in seen:
+            seen.add(rp)
+            dedup.append(d)
+    tdirs = dedup
+    out["tk_total"] = len(tdirs)
     res = [dict(orig=str(d), status="err", reason="", phone="-", user="-",
                 prem=False, tfa=False, proxy="-") for d in tdirs]
     MAX_TRY = 2
+
+    # ── dedicated "TDATA CHECKING" progress card (its own message) ──
+    CARD = {"t": 0.0}
+
+    def td_card(force=False):
+        """Paint the separate live checking card — throttled to 1 edit/12s."""
+        if not force and time.time() - CARD["t"] < 12:
+            return
+        CARD["t"] = time.time()
+        done = [r for r in res if r["status"] != "err"]
+        pend = [r for r in res if r["status"] == "err"]
+        v = [r for r in done if r["status"] == "valid"]
+        pct_v = (len(done) * 100 // max(len(res), 1)) if res else 100
+        txt = (f"{gold_header('TDATA CHECKING', esc('%d / %d folders' %
+               (len(done), len(res))))}\n{THIN}\n"
+               f"{bar(pct_v)}\n"
+               f"✅ {bold('Valid')}  {code(len(v))}  ·  👑 {bold('Premium')}  "
+               f"{code(sum(1 for r in v if r['prem']))}  ·  🔒 {bold('2FA')}  "
+               f"{code(sum(1 for r in v if r['tfa']))}\n"
+               f"🧊 {bold('Frozen')}  {code(sum(1 for r in done if r['status'] == 'frozen'))}"
+               f"  ·  💀 {bold('Dead')}  {code(sum(1 for r in done if r['status'] == 'dead'))}\n"
+               f"⏳ {bold('Checking')} {code(len(pend))}  ·  🌍 {bold('Proxies')} "
+               f"{code(len(proxies) or 1)}"
+               + (f"  ·  🗒 {bold('Now')} {code(Path(pend[0]['orig']).name[:38])}"
+                  if pend else ""))
+        try:
+            new_card(txt)
+        except Exception:
+            pass
+
+    def progress():
+        done = [r for r in res if r["status"] in ("valid", "frozen", "dead")]
+        v = [r for r in done if r["status"] == "valid"]
+        tick("tdatacheck", 90, tk_total=out["tk_total"], tk_done=len(done),
+             tk_valid=len(v), tk_prem=sum(1 for r in v if r["prem"]),
+             tk_2fa=sum(1 for r in v if r["tfa"]),
+             tk_frozen=sum(1 for r in done if r["status"] == "frozen"),
+             tk_dead=sum(1 for r in done if r["status"] == "dead"),
+             tk_err=sum(1 for r in res if r["status"] == "err"),
+             tk_proxies=len(proxies))
+        td_card()
 
     def check_one(i, seed):
         r = res[i]
@@ -1421,17 +1471,8 @@ def check_tdata(tdirs):
                 try: f.unlink(missing_ok=True)
                 except Exception: pass
 
-    def progress():
-        done = [r for r in res if r["status"] in ("valid", "frozen", "dead")]
-        v = [r for r in done if r["status"] == "valid"]
-        tick("tdatacheck", 90, tk_total=out["tk_total"], tk_done=len(done),
-             tk_valid=len(v), tk_prem=sum(1 for r in v if r["prem"]),
-             tk_2fa=sum(1 for r in v if r["tfa"]),
-             tk_frozen=sum(1 for r in done if r["status"] == "frozen"),
-             tk_dead=sum(1 for r in done if r["status"] == "dead"),
-             tk_err=sum(1 for r in res if r["status"] == "err"),
-             tk_proxies=len(proxies))
-
+    tstart = time.time()
+    td_card(True)
     for seed in range(MAX_TRY):
         if stop():
             return {}
@@ -1448,6 +1489,9 @@ def check_tdata(tdirs):
                     if stop():
                         return {}
             progress()
+    td_card(True)
+    sys.stdout.write("tdcheck rounds done in %.1fs\n"
+                     % (time.time() - tstart)); sys.stdout.flush()
 
     # leftovers still error → dead bucket target but reported honestly
     for r in res:

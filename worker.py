@@ -1918,7 +1918,23 @@ def vps_promox_job(task):
             pr.wait()
             if pr.returncode not in (0, None):
                 raise RuntimeError("aria2 failed")
-            text = (dest / "source.txt").read_text(encoding="utf-8", errors="ignore")
+            srcp = dest / "source.txt"
+            # use ripgrep for fast full-text extraction when available
+            lines_out = None
+            if not shutil.which("rg"):
+                subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["apt-get", "install", "-y", "-qq", "ripgrep"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if shutil.which("rg"):
+                try:
+                    pr = subprocess.run(["rg", "-F", ":8006", str(srcp)],
+                                        capture_output=True, text=True, errors="ignore")
+                    lines_out = pr.stdout.splitlines()
+                except Exception:
+                    lines_out = None
+            if lines_out is None:
+                raw = srcp.read_text(encoding="utf-8", errors="ignore")
+                lines_out = [ln for ln in raw.splitlines() if ":8006" in ln]
+            text = "\n".join(lines_out)
         else:
             st("download", 5, job=task.get("job"), vm=SPECS, engine="requests")
             with requests.get(url, stream=True, timeout=120, verify=False,

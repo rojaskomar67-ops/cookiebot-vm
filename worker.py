@@ -1886,10 +1886,23 @@ def vps_promox_job(task):
     url = task.get("url")
     try:
         st("download", 5, job=task.get("job"), vm=SPECS)
-        r = requests.get(url, timeout=120, verify=False,
-                         headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        text = r.text
+        with requests.get(url, stream=True, timeout=120, verify=False,
+                         headers={"User-Agent": "Mozilla/5.0"}) as r:
+            r.raise_for_status()
+            tot = int(r.headers.get("content-length") or 0)
+            done = 0
+            chunks = []
+            t0 = time.time()
+            for ch in r.iter_content(chunk_size=1 << 20):
+                if stop():
+                    finish(task, "cancelled", err="cancelled"); return
+                chunks.append(ch)
+                done += len(ch)
+                pct = 5 + (done * 20 // tot if tot else 0)
+                st("download", pct, job=task.get("job"), vm=SPECS,
+                   got=fs(done), total=fs(tot) if tot else "?",
+                   elapsed=ft(time.time() - t0))
+            text = b"".join(chunks).decode("utf-8", "ignore")
     except Exception as e:
         finish(task, "error", err="download failed: %s" % str(e)[:80]); return
     entries = []; invalid = []; seen = set()

@@ -1815,7 +1815,7 @@ def _vps_reach_one(entry):
     url, user, pwd, raw = entry
     base = url.rstrip()
     try:
-        r = requests.get(base, timeout=8, verify=False, allow_redirects=True,
+        r = requests.get(base, timeout=5, verify=False, allow_redirects=True,
                          headers={"User-Agent": "Mozilla/5.0"})
         return (entry, True, r.status_code)
     except Exception as e:
@@ -1825,7 +1825,7 @@ def _vps_reach_one(entry):
         pu = urllib.parse.urlsplit(base)
         host = pu.hostname
         port = pu.port or (443 if pu.scheme == "https" else 80)
-        so = socket.create_connection((host, port), timeout=8)
+        so = socket.create_connection((host, port), timeout=5)
         so.close()
         return (entry, True, 0)
     except Exception as e:
@@ -1834,14 +1834,14 @@ def _vps_reach_one(entry):
 def _vps_is_proxmox(base):
     base = base.rstrip()
     try:
-        r = requests.get(base + "/api2/json/version", timeout=10, verify=False,
+        r = requests.get(base + "/api2/json/version", timeout=5, verify=False,
                          headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code == 200 and "version" in (r.text or ""):
             return True
     except Exception:
         pass
     try:
-        r = requests.get(base + "/", timeout=10, verify=False,
+        r = requests.get(base + "/", timeout=5, verify=False,
                          headers={"User-Agent": "Mozilla/5.0"})
         return "Proxmox Virtual Environment" in (r.text or "")
     except Exception:
@@ -1857,7 +1857,7 @@ def _vps_check_one(entry):
     if "@" not in user:
         data["realm"] = "pam"
     try:
-        r = requests.post(login_url, data=data, timeout=15, verify=False,
+        r = requests.post(login_url, data=data, timeout=8, verify=False,
                           headers={"User-Agent": "Mozilla/5.0"})
     except Exception as e:
         return (entry, "error", str(e)[:80])

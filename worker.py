@@ -1953,7 +1953,29 @@ def vps_promox_job(task):
                        elapsed=ft(time.time() - t0))
                 text = b"".join(chunks).decode("utf-8", "ignore")
     except Exception as e:
-        finish(task, "error", err="download failed: %s" % str(e)[:80]); return
+        # aria2 failed -> fall back to requests streaming
+        try:
+            st("download", 5, job=task.get("job"), vm=SPECS, engine="requests (fallback)")
+            dest = WORK / "dl"; dest.mkdir(parents=True, exist_ok=True)
+            with requests.get(url, stream=True, timeout=120, verify=False,
+                             headers={"User-Agent": "Mozilla/5.0"}) as r:
+                r.raise_for_status()
+                tot = int(r.headers.get("content-length") or 0)
+                done = 0
+                chunks = []
+                t0 = time.time()
+                for ch in r.iter_content(chunk_size=1 << 20):
+                    if stop():
+                        finish(task, "cancelled", err="cancelled"); return
+                    chunks.append(ch); done += len(ch)
+                    pct = 5 + (done * 20 // tot if tot else 0)
+                    st("download", pct, job=task.get("job"), vm=SPECS,
+                       got=fs(done), total=fs(tot) if tot else "?",
+                       elapsed=ft(time.time() - t0))
+                text = b"".join(chunks).decode("utf-8", "ignore")
+            (dest / "source.txt").write_text(text, encoding="utf-8")
+        except Exception as e2:
+            finish(task, "error", err="download failed: %s" % str(e2)[:80]); return
     entries = []; invalid = []; seen = set()
     for ln in text.splitlines():
         if ":8006" not in ln:

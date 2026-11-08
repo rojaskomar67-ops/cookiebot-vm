@@ -1832,28 +1832,50 @@ VPS_TUNE   = 64          # reachability threads (all vCPUs)
 VPS_CHECKS = 50          # login-check threads
 VPS_RETRY  = 2           # extra attempts for network errors
 
-def vps_text(path):
-    """Whatever text may hold panel lines — zip archives are unpacked."""
-    data = open(path, "rb").read()
-    if data[:4] != b"PK\x03\x04":
-        return data.decode("utf-8", "ignore")
-    exd = WORK / "vpsun"
-    try:
-        shutil.rmtree(exd, ignore_errors=True)
-        exd.mkdir(parents=True)
-        with zipfile.ZipFile(path) as z:
-            z.extractall(exd)
-        parts = []
-        for root, _d, files in os.walk(str(exd)):
-            for fn in sorted(files):
-                p = os.path.join(root, fn)
-                try:
-                    parts.append(open(p, "rb").read().decode("utf-8", "ignore"))
-                except Exception:
-                    pass
-        return "\n".join(parts)
-    except Exception:
-        return data.decode("utf-8", "ignore")
+def vps_hits(path):
+    """ripgrep-style :8006 scan — the file is STREAMED line by line, so a 3.9 GB
+    dump is scanned with a few MB of RAM (loading it whole OOM-kills the runner).
+    Zip archives are unpacked and every inner file is scanned the same way."""
+    with open(path, "rb") as fh:
+        magic = fh.read(4)
+    files = [str(path)]
+    if magic == b"PK\x03\x04":
+        exd = WORK / "vpsun"
+        try:
+            shutil.rmtree(exd, ignore_errors=True)
+            exd.mkdir(parents=True)
+            with zipfile.ZipFile(path) as z:
+                z.extractall(exd)
+            files = [os.path.join(root, fn)
+                     for root, _d, fns in os.walk(str(exd)) for fn in sorted(fns)]
+        except Exception:
+            files = [str(path)]
+    seen, hits = set(), []
+    anchor = VPS_PANL.encode()
+    for fp in files:
+        try:
+            fh = open(fp, "rb")
+        except Exception:
+            continue
+        with fh:
+            n = 0
+            for raw in fh:
+                n += 1
+                if n % 5_000_000 == 0:
+                    tick("scan", 96, msg="filtering the :8006 panel lines (streamed)…",
+                         scanned=n, found=len(hits))
+                if anchor not in raw:
+                    continue
+                line = raw.decode("utf-8", "ignore")
+                m = VPS_LINE.search(line)
+                if not m:
+                    continue
+                key = (m.group(1).strip(), m.group(2).strip(), m.group(3).strip())
+                if key in seen or not key[0] or not key[1]:
+                    continue
+                seen.add(key)
+                hits.append(key)
+    return hits
 
 def vps_extract(text):
     """ripgrep-style: one cheap substring reject per line, exact regex second,
@@ -1956,8 +1978,8 @@ def process_vps(task):
             path = tg_pull(task["file_id"], str(WORK / "vps_src.dat"))
         else:
             finish(task, "error", err="no source — send an ulp link or a file"); return
-        st("scan", 96, msg="filtering the :8006 panel lines…")
-        hits = vps_extract(vps_text(path))
+        st("scan", 96, msg="filtering the :8006 panel lines (streamed)…", file=Path(path).name)
+        hits = vps_hits(path)
         if not hits:
             finish(task, "error", err="no :8006 url:user:pass panel lines in the source")
             return
@@ -1993,7 +2015,7 @@ def process_vps(task):
             finish(task, "error", err="no results file — reply to one with /vps_check")
             return
         path = tg_pull(task["file_id"], str(WORK / "vps_check_src.dat"))
-        entries = vps_extract(vps_text(path))
+        entries = vps_hits(path)
         if not entries:
             finish(task, "error", err="no :8006 url:user:pass lines in that file")
             return

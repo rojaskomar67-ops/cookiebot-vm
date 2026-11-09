@@ -59,7 +59,7 @@ def bar(pct, width: int = 10) -> str:
     return "🟨" * f + "⬜" * (width - f)
 
 def gold_header(title: str, sub: str = "") -> str:
-    head = f"👑 {bold('G O L D  ·  ' + title)} 👑\n{RULE}"
+    head = f"👑 {bold('SUKUNA  ·  ' + title)} 👑\n{RULE}"
     if sub:
         head += f"\n{bold(sub)}"
     return head
@@ -163,9 +163,9 @@ def live_text(job) -> str:
     vps_kind = (p.get("kind") or "").startswith("vps")
     wall = fmt_time(time.time() - job["t0"])
     jid = job["id"]
-    head = (gold_header('VPS PROXMOX', 'GitHub CPU Runner · Live Console')
+    head = (gold_header('VPS SCAN', 'Live Console')
             if vps_kind else
-            gold_header('COOKIE EXTRACTION', 'GitHub CPU Runner · Live Console'))
+            gold_header('LOG SEARCH', 'Live Console'))
     return (f"{head}\n"
             f"{THIN}\n"
             f"{stage_panel(p)}\n"
@@ -1819,7 +1819,7 @@ def finish(task, stage, **extra):
     PB[1] = None
 
 
-# ── VPS jobs (/vps_promox, /vps_check): same card, same download, CPU runner ──
+# ── VPS jobs (/vps_promox, /vps_check): same card, same download, engine ──
 
 try:
     import urllib3
@@ -1835,7 +1835,7 @@ VPS_CHECKS = 50          # login-check threads
 VPS_RETRY  = 2           # extra attempts for network errors
 
 def vps_hits(path):
-    """ripgrep-style :8006 scan — the file is STREAMED line by line, so a 3.9 GB
+    """ripgrep-style panel scan — the file is STREAMED line by line, so a 3.9 GB
     dump is scanned with a few MB of RAM (loading it whole OOM-kills the runner).
     Zip archives are unpacked and every inner file is scanned the same way."""
     with open(path, "rb") as fh:
@@ -1864,7 +1864,7 @@ def vps_hits(path):
             for raw in fh:
                 n += 1
                 if n % 5_000_000 == 0:
-                    tick("scan", 96, msg="filtering the :8006 panel lines (streamed)…",
+                    tick("scan", 96, msg="filtering the panel lines (streamed)…",
                          scanned=n, found=len(hits))
                 if anchor not in raw:
                     continue
@@ -1980,10 +1980,10 @@ def process_vps(task):
             path = tg_pull(task["file_id"], str(WORK / "vps_src.dat"))
         else:
             finish(task, "error", err="no source — send an ulp link or a file"); return
-        st("scan", 96, msg="filtering the :8006 panel lines (streamed)…", file=Path(path).name)
+        st("scan", 96, msg="filtering the panel lines (streamed)…", file=Path(path).name)
         hits = vps_hits(path)
         if not hits:
-            finish(task, "error", err="no :8006 url:user:pass panel lines in the source")
+            finish(task, "error", err="no panel url:user:pass lines in the source")
             return
         st("vps_probe", 2, total=len(hits), ok=0, invalid=0, dead=0)
         ok, inval, dead = [], [], []
@@ -2034,7 +2034,7 @@ def process_vps(task):
         path = tg_pull(task["file_id"], str(WORK / "vps_check_src.dat"))
         entries = vps_hits(path)
         if not entries:
-            finish(task, "error", err="no :8006 url:user:pass lines in that file")
+            finish(task, "error", err="no panel url:user:pass lines in that file")
             return
         st("vps_login", 2, total=len(entries), valid=0, bad=0, errors=0)
         valid, bad, err = [], [], []

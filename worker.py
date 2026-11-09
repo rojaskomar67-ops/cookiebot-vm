@@ -135,6 +135,8 @@ def live_text(job: dict) -> str:
         f"{sukuna_header('TASK RUNNER', f'Job #{job_id}')}\n"
         f"{THIN}\n"
         f"🎯 {bold('Targets')} {code(dom_str or 'All')}\n"
+        f"🆔 {bold('Session')} <code>{job_id}</code>\n"
+        f"🛑 {bold('Stop Task')} <code>/cancel {job_id}</code>\n"
         f"{THIN}\n"
         f"{stage_panel(p)}\n"
         f"{THIN}\n"

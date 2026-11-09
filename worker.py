@@ -21,11 +21,25 @@ _flush = [0.0]
 RULE   = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
 THIN   = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
 STAGE_ICON = {'boot': '🟡', 'idle': '🟢', 'installing': '🧩', 'download': '📥', 'downloaded': '✅', 'extract': '📦', 'extracted': '✅', 'wrong_password': '🔑', 'scan': '🔍', 'authcheck': '🔎', 'tdatacheck': '🗂', 'vps_probe': '🌐', 'vps_login': '🔐', 'vps_pack': '📤', 'packed': '🗃', 'done': '🏁', 'error': '❌', 'cancelled': '🛑', 'cancelling': '🛑', 'queued': '⏳', 'retired': '♻️', 'ttl_expired': '♻️'}
+HEADER_MARK = '◆'
+BAR_WIDTH = 10
+BAR_FULL = '█'
+BAR_EMPTY = '░'
+USE_BLOCKQUOTES = True
+EXPAND_LONG_HELP = True
+BOT_NAME = 'Sukuna'
 VM_TTL = 3600
 class _Ref:
     ref = 'rojaskomar67-ops/cookiebot-vm'
     born = time.time()
 vm = _Ref()
+def bq(text: str, expand: bool = False) -> str:
+    """Telegram block quote (optionally expandable) — clean, modern banner style."""
+    if not USE_BLOCKQUOTES:
+        return italic(text)
+    tag = "blockquote expandable" if (expand and EXPAND_LONG_HELP) else "blockquote"
+    return f"<{tag}>{text}</blockquote>"
+
 def esc(x) -> str:
     return str(x if x is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -53,16 +67,19 @@ def fmt_time(s) -> str:
     h, m = divmod(m, 60)
     return f"{h}h {m}m"
 
-def bar(pct, width: int = 10) -> str:
+def bar(pct, width: int = None) -> str:
+    """Monospace progress bar: filled blocks + light blocks."""
+    w = width or BAR_WIDTH
     pct = max(0, min(100, int(pct or 0)))
-    f = round(pct / 100 * width)
-    return "🟨" * f + "⬜" * (width - f)
+    f = round(pct / 100 * w)
+    return BAR_FULL * f + BAR_EMPTY * (w - f)
 
 def gold_header(title: str, sub: str = "") -> str:
-    head = f"👑 {bold('SUKUNA  ·  ' + title)} 👑\n{RULE}"
+    """Card header — bot name + title inside a block quote (no emoji clutter)."""
+    inner = f"{HEADER_MARK} {bold(BOT_NAME.upper() + '  ·  ' + title)}\n{RULE}"
     if sub:
-        head += f"\n{bold(sub)}"
-    return head
+        inner += f"\n{sub}"
+    return bq(inner)
 
 def vm_card(p: dict, job: dict) -> str:
     """Hardware + lifetime panel for the CPU Space running this job."""
@@ -149,7 +166,7 @@ def stage_panel(p: dict) -> str:
         lines.append(f"🗃 {code('%d folders' % p.get('tk_total', 0))}"
                      f"  {bar((p.get('tk_done') or 0) * 100 // max(p.get('tk_total'), 1))}")
         lines.append(f"✅ {code(p.get('tk_valid', 0))} valid "
-                     f"(👑 {code(p.get('tk_prem', 0))} premium · 🔒 {code(p.get('tk_2fa', 0))} 2FA)")
+                     f"(★ {code(p.get('tk_prem', 0))} premium · 🔒 {code(p.get('tk_2fa', 0))} 2FA)")
         lines.append(f"🧊 {code(p.get('tk_frozen', 0))} frozen   "
                      f"💀 {code(p.get('tk_dead', 0))} dead   ⏳ {code(p.get('tk_err', 0))} retrying"
                      f"   🌍 {code(p.get('tk_proxies', 0))} proxies")
@@ -1395,7 +1412,7 @@ def check_tdata(tdirs):
         txt = (f"{gold_header('TDATA CHECKING', esc('%d / %d folders' %
                (len(done), len(res))))}\n{THIN}\n"
                f"{bar(pct_v)}\n"
-               f"✅ {bold('Valid')}  {code(len(v))}  ·  👑 {bold('Premium')}  "
+               f"✅ {bold('Valid')}  {code(len(v))}  ·  ★ {bold('Premium')}  "
                f"{code(sum(1 for r in v if r['prem']))}  ·  🔒 {bold('2FA')}  "
                f"{code(sum(1 for r in v if r['tfa']))}\n"
                f"🧊 {bold('Frozen')}  {code(sum(1 for r in done if r['status'] == 'frozen'))}"
@@ -1591,7 +1608,7 @@ def check_tdata(tdirs):
     def tdcap(size, idx, count, tot, split):
         return (f"{gold_header('TDATA CHECK DONE', esc(str(len(res)) + ' folders'))}"
                 f"\n{THIN}\n"
-                f"✅ {bold('Valid')}     {code(len(valid))}  👑 {bold('Premium')}  "
+                f"✅ {bold('Valid')}     {code(len(valid))}  ★ {bold('Premium')}  "
                 f"{code(len(prem))} · ⛅ {bold('Free')}  {code(len(free))}\n"
                 f"🔒 {bold('2FA on')}   {code(len(twofa))}\n"
                 f"🧊 {bold('Frozen')}    {code(len(fro))}  ·  💀 {bold('Dead')}  "

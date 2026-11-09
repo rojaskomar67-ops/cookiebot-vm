@@ -56,6 +56,9 @@ def bold(x) -> str:
 def code(x) -> str:
     return f"<code>{esc(x)}</code>"
 
+def italic(x) -> str:
+    return f"<i>{esc(x)}</i>"
+
 def fmt_size(num) -> str:
     num = float(num or 0)
     for u in ("B", "KB", "MB", "GB", "TB"):

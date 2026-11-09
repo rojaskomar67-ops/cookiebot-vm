@@ -162,6 +162,7 @@ def live_text(job) -> str:
     p = job.get("prog") or {}
     vps_kind = (p.get("kind") or "").startswith("vps")
     wall = fmt_time(time.time() - job["t0"])
+    jid = job["id"]
     head = (gold_header('VPS PROXMOX', 'GitHub CPU Runner · Live Console')
             if vps_kind else
             gold_header('COOKIE EXTRACTION', 'GitHub CPU Runner · Live Console'))
@@ -171,7 +172,8 @@ def live_text(job) -> str:
             f"{THIN}\n"
             f"{vm_card(p, job)}\n"
             f"{THIN}\n"
-            f"⏳ {bold('Wall time')} {code(wall)}   🆔 {code(job['id'])}")
+            f"⏳ {bold('Wall time')} {code(wall)}   🆔 {code(jid)}\n"
+            f"🛑 Cancel: {code('/cancel ' + jid)}")
 
 
 def job_ctx():

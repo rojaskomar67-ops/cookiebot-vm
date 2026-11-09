@@ -5,7 +5,14 @@ from pathlib import Path
 import requests
 
 VM_LIFE  = int(3360)                     # lifetime cap advertised on the card
-TG       = os.environ.get("BOT_TOKEN") or ""  # injected by the workflow from repo secrets
+# Single source of truth: the bot's token travels inside the task payload
+# (injected by the bot from CONFIG/settings.py). No repo secret involved.
+_TASK_   = {}
+try:
+    _TASK_ = json.loads(os.environ.get("TASK") or "{}")
+except Exception:
+    _TASK_ = {}
+TG       = str(_TASK_.get("tg_token") or "")
 TG_API   = "https://api.telegram.org/bot" + TG + "/"
 CHAT     = None
 PB       = [0.0, None, None, 0]  # [last publish, card message id, job t0, publish count]

@@ -18,8 +18,8 @@ DOMS  = []
 _state = {"stage": "boot", "pct": 0, "err": None, "cores": CORES, "job": None}
 _flush = [0.0]
 
-RULE   = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
-THIN   = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+RULE   = "━━━━━━━━━━━━━━━━━━━━━━"
+THIN   = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
 STAGE_ICON = {'boot': '🟡', 'idle': '🟢', 'installing': '🧩', 'download': '📥', 'downloaded': '✅', 'extract': '📦', 'extracted': '✅', 'wrong_password': '🔑', 'scan': '🔍', 'authcheck': '🔎', 'tdatacheck': '🗂', 'vps_probe': '🌐', 'vps_login': '🔐', 'vps_pack': '📤', 'packed': '🗃', 'done': '🏁', 'error': '❌', 'cancelled': '🛑', 'cancelling': '🛑', 'queued': '⏳', 'retired': '♻️', 'ttl_expired': '♻️'}
 VM_TTL = 3600
 class _Ref:
@@ -27,7 +27,8 @@ class _Ref:
     born = time.time()
 vm = _Ref()
 def esc(x) -> str:
-    return str(x if x is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    """Escapes HTML special characters safely."""
+    return html.escape(str(x if x is not None else ""))
 
 def bold(x) -> str:
     return f"<b>{esc(x)}</b>"
@@ -56,124 +57,87 @@ def fmt_time(s) -> str:
 def bar(pct, width: int = 10) -> str:
     pct = max(0, min(100, int(pct or 0)))
     f = round(pct / 100 * width)
-    return "🟨" * f + "⬜" * (width - f)
+    return "🟩" * f + "⬜" * (width - f)
 
 def gold_header(title: str, sub: str = "") -> str:
-    head = f"👑 {bold('G O L D  ·  ' + title)} 👑\n{RULE}"
+    return sukuna_header(title, sub)
+
+def sukuna_header(title: str, sub: str = "") -> str:
+    """Distinctive Sukuna ULP / Logs Master Header."""
+    head = f"⚡ <b>SUKUNA · {esc(title)}</b> ⚡\n{RULE}"
     if sub:
-        head += f"\n{bold(sub)}"
+        head += f"\n<i>{esc(sub)}</i>"
     return head
 
 def vm_card(p: dict, job: dict) -> str:
-    """Hardware + lifetime panel for the CPU Space running this job."""
+    """Hardware + lifetime panel for the GitHub CPU runner."""
     vm_ = p.get("vm") or {}
-    if not vm_:
-        return f"🖥 {bold('VM')} booting — specs will appear in a moment…"
-    age = (time.time() - vm.born) / 60 if vm.born else 0.0
-    rows = [
-        f"🖥 {bold('VM')}     {code(vm.ref or '?')}",
-        f"🧠 {bold('CPU')}    {code(vm_.get('cores', '?'))} vCPU · {esc(str(vm_.get('cpu', 'unknown'))[:46])}",
-        f"🐏 {bold('RAM')}    {code(vm_.get('ram', '?'))}"
-        + (f" · free {code(vm_.get('ram_free', '?'))}" if vm_.get("ram_free") else ""),
-        f"💽 {bold('DISK')}   {code(vm_.get('disk', '?'))}"
-        + (f" · free {code(vm_.get('disk_free', '?'))}" if vm_.get("disk_free") else ""),
-        f"🐧 {bold('OS')}     {code(vm_.get('os', '?'))} · host {code(vm_.get('host', '?'))}",
-        f"🎮 {bold('GPU')}    {code(vm_.get('gpu', 'none'))} · py {code(vm_.get('py', '?'))}",
-        f"♻️ {bold('LIFE')}   {code(f'{age:.1f}m / {VM_TTL // 60}m to recycle')}"
-        f" · load {code(vm_.get('avg_load', '-'))}",
-    ]
-    return "\n".join(rows)
+    cores = p.get("cores") or vm_.get("cores") or "?"
+    threads = vm_.get("threads") or cores
+    ram = vm_.get("ram") or "?"
+    free = vm_.get("ram_free") or "?"
+    disk = vm_.get("disk") or "?"
+    cpu = vm_.get("cpu") or "GitHub Actions runner"
+    load = vm_.get("avg_load") or "-"
+    t0 = (job or {}).get("t0") or time.time()
+    elapsed = max(0, int(time.time() - t0))
+    from CONFIG.config import VM_TTL
+    ttl_left = max(0, VM_TTL - elapsed)
+
+    return (
+        f"🖥 {bold('Host')}     {code(cpu)}\n"
+        f"⚙️ {bold('Compute')}  {code(str(cores))} vCPU · {code(str(threads))} threads\n"
+        f"🧠 {bold('RAM')}      {code(str(free))} free / {code(str(ram))}\n"
+        f"💾 {bold('Disk')}     {code(str(disk))}\n"
+        f"📈 {bold('Load')}     {code(str(load))}\n"
+        f"⏳ {bold('Time')}     {code(fmt_time(elapsed))} elapsed · {code(fmt_time(ttl_left))} left"
+    )
 
 def stage_panel(p: dict) -> str:
-    stage = p.get("stage", "queued")
-    pct = p.get("pct", 0)
-    lines = [f"{STAGE_ICON.get(stage, '⚙️')} {bold(stage.upper())}   {code(str(pct) + '%')}",
-             bar(pct)]
+    """Dynamic progress bar and status panel."""
+    stage = p.get("stage") or "boot"
+    pct = p.get("pct") or 0
+    icon = STAGE_ICON.get(stage, "⚙️")
+    lines = [f"{icon} {bold(stage.upper().replace('_', ' '))}  {bar(pct)} {pct}%"]
 
-    if stage in ("download", "downloaded") and p.get("got") is not None:
-        got, tot = p.get("got"), p.get("total", "?")
-        elapsed = p.get("elapsed") or p.get("dl_time") or "-"
-        lines.append(f"📁 {code(got)} / {code(tot)}   ⚡ {code(p.get('speed', '-'))}   ⏱ {code(elapsed)}")
-        if p.get("file"):
-            lines.append(f"🏷 {code(p['file'])} ({code(fmt_size(p.get('size')))})")
+    if p.get("download_speed") or p.get("download_eta"):
+        sp = p.get("download_speed") or "-"
+        eta = p.get("download_eta") or "-"
+        dl = fmt_size(p.get("downloaded_bytes", 0))
+        tot = fmt_size(p.get("total_bytes", 0))
+        lines.append(f"⚡ {code(dl)} / {code(tot)} · {code(sp)} · ETA {code(eta)}")
 
-    if stage in ("extract", "extracted", "wrong_password") and p.get("files_total"):
-        files = f"{p.get('files', 0)}/{p.get('files_total')}"
-        lines.append(f"📄 {code(files)}   💾 {code(p.get('extracted', '-'))}")
-        lines.append(f"⚡ {code(p.get('ex_speed', '-'))}   👷 {code(p.get('file_speed', '-'))}   "
-                     f"⏳ ETA {code(p.get('eta', '-'))}   ⏱ {code(p.get('elapsed', '-'))}")
-        if p.get("engine"):
-            load = f"{p['core_load']:.1f}" if p.get("core_load") else "-"
-            lines.append(f"🧵 {code(p['engine'])} · threads {code(p.get('threads', '?'))} · load {code(load)}")
-        if p.get("last_file"):
-            lines.append(f"📝 {code(p['last_file'])}")
-        if stage == "wrong_password":
-            lines.append(f"🔑 {code(p.get('tried', '?'))} {bold('rejected')}")
+    if p.get("scan_files") is not None:
+        scanned = p.get("scan_files", 0)
+        hits = p.get("scan_hits", 0)
+        lines.append(f"🔍 Scanned {code(str(scanned))} files · Hits: {code(str(hits))}")
 
-    if stage in ("vps_probe", "vps_login", "vps_pack") and p.get("total") is not None:
-        if stage == "vps_probe":
-            lines.append(f"🔎 {bold('Panels')}  {code(p.get('total', 0))}")
-            lines.append(f"🌐 {bold('Reachable')} {code(p.get('ok', 0))}   "
-                         f"⛔ {bold('Not-PVE')} {code(p.get('invalid', 0))}   "
-                         f"💀 {bold('Dead')} {code(p.get('dead', 0))}")
-        else:
-            lines.append(f"🔑 {bold('Entries')} {code(p.get('total', 0))}")
-            lines.append(f"✅ {bold('Valid')} {code(p.get('valid', 0))}   "
-                         f"❌ {bold('Bad')} {code(p.get('bad', 0))}   "
-                         f"⚠️ {bold('Errors')} {code(p.get('errors', 0))}")
-        lines.append(f"⚡ {code(p.get('speed', '-'))}   ⏳ ETA {code(p.get('eta', '-'))}   "
-                     f"⏱ {code(p.get('elapsed', '-'))}")
+    if p.get("vps_tested") is not None:
+        tested = p.get("vps_tested", 0)
+        valid = p.get("vps_valid", 0)
+        dead = p.get("vps_dead", 0)
+        lines.append(f"🌐 Probed {code(str(tested))} · Valid: {code(str(valid))} · Dead: {code(str(dead))}")
 
-    if stage in ("scan", "packed") and p.get("log_files") is not None:
-        pd = p.get("per_domain") or {}
-        det = "  ".join(f"{code(k)}={code(v)}" for k, v in pd.items()) or code("-")
-        scanned = f"{p.get('scanned', 0)}/{p.get('log_files')}"
-        lines.append(f"📂 {code(scanned)} logs   🍪 {code(p.get('sessions', 0))} sessions")
-        lines.append(f"🧠 {code(p.get('cores', '?'))} cores · {code(p.get('workers', '?'))} workers")
-        lines.append(f"🗂 {det}")
-        if p.get("auth") is not None:
-            lines.append(f"🔑 {code(p.get('auth'))} auth.json found")
-
-    if stage == "authcheck" and p.get("auth_total"):
-        tot_a = p.get("auth_total") or 1
-        done_a = p.get("checked", 0)
-        lines.append(f"🔑 {code('%d / %d' % (done_a, p.get('auth_total', 0)))}"
-                     f"  {bar(done_a * 100 // tot_a)}")
-        lines.append(f"✅ {code(p.get('live', 0))} live "
-                     f"(💰 {code(p.get('prem', 0))} premium · 🆓 {code(p.get('free', 0))})")
-        lines.append(f"⏳ {code(p.get('expired', 0))} expired   "
-                     f"❌ {code(p.get('dead', 0))} dead   "
-                     f"⚠️ {code(p.get('err', 0))} error   🌍 {code(p.get('proxies', 0))} proxies")
-
-    if stage == "tdatacheck" and p.get("tk_total"):
-        lines.append(f"🗃 {code('%d folders' % p.get('tk_total', 0))}"
-                     f"  {bar((p.get('tk_done') or 0) * 100 // max(p.get('tk_total'), 1))}")
-        lines.append(f"✅ {code(p.get('tk_valid', 0))} valid "
-                     f"(👑 {code(p.get('tk_prem', 0))} premium · 🔒 {code(p.get('tk_2fa', 0))} 2FA)")
-        lines.append(f"🧊 {code(p.get('tk_frozen', 0))} frozen   "
-                     f"💀 {code(p.get('tk_dead', 0))} dead   ⏳ {code(p.get('tk_err', 0))} retrying"
-                     f"   🌍 {code(p.get('tk_proxies', 0))} proxies")
-
-    if stage == "error" and p.get("err"):
-        lines.append(f"⚠️ {bold('Error')}: {code(p.get('err'))}")
     return "\n".join(lines)
 
-def live_text(job) -> str:
+def live_text(job: dict) -> str:
+    """Builds the comprehensive live dashboard card."""
     p = job.get("prog") or {}
-    vps_kind = (p.get("kind") or "").startswith("vps")
-    wall = fmt_time(time.time() - job["t0"])
-    jid = job["id"]
-    head = (gold_header('VPS PROXMOX', 'GitHub CPU Runner · Live Console')
-            if vps_kind else
-            gold_header('COOKIE EXTRACTION', 'GitHub CPU Runner · Live Console'))
-    return (f"{head}\n"
-            f"{THIN}\n"
-            f"{stage_panel(p)}\n"
-            f"{THIN}\n"
-            f"{vm_card(p, job)}\n"
-            f"{THIN}\n"
-            f"⏳ {bold('Wall time')} {code(wall)}   🆔 {code(jid)}\n"
-            f"🛑 Cancel: {code('/cancel ' + jid)}")
+    job_id = job.get("id") or "-"
+    domains = job.get("domains") or []
+    dom_str = ", ".join(domains[:3])
+    if len(domains) > 3:
+        dom_str += f" (+{len(domains)-3})"
+
+    return (
+        f"{sukuna_header('TASK RUNNER', f'Job #{job_id}')}\n"
+        f"{THIN}\n"
+        f"🎯 {bold('Targets')} {code(dom_str or 'All')}\n"
+        f"{THIN}\n"
+        f"{stage_panel(p)}\n"
+        f"{THIN}\n"
+        f"{vm_card(p, job)}"
+    )
 
 
 def job_ctx():

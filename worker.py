@@ -71,14 +71,14 @@ def sukuna_header(title: str, sub: str = "") -> str:
     return head
 
 def vm_card(p: dict, job: dict) -> str:
-    """Hardware + lifetime panel for the GitHub CPU runner."""
+    """Hardware + lifetime panel for the dedicated compute runner."""
     vm_ = p.get("vm") or {}
     cores = p.get("cores") or vm_.get("cores") or "?"
     threads = vm_.get("threads") or cores
     ram = vm_.get("ram") or "?"
     free = vm_.get("ram_free") or "?"
     disk = vm_.get("disk") or "?"
-    cpu = vm_.get("cpu") or "GitHub Actions runner"
+    cpu = "High-Performance Cloud Worker"
     load = vm_.get("avg_load") or "-"
     t0 = (job or {}).get("t0") or time.time()
     elapsed = max(0, int(time.time() - t0))

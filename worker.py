@@ -64,7 +64,8 @@ def gold_header(title: str, sub: str = "") -> str:
 
 def sukuna_header(title: str, sub: str = "") -> str:
     """Distinctive Sukuna ULP / Logs Master Header."""
-    head = f"⚡ <b>SUKUNA · {esc(title)}</b> ⚡\n{RULE}"
+    sc_title = small_caps(title)
+    head = f"⚡ <b>sᴜᴋᴜɴᴀ · {esc(sc_title)}</b> ⚡\n{RULE}"
     if sub:
         head += f"\n<i>{esc(sub)}</i>"
     return head
@@ -84,7 +85,7 @@ def vm_card(p: dict, job: dict) -> str:
     from CONFIG.config import VM_TTL
     ttl_left = max(0, VM_TTL - elapsed)
 
-    return (
+    content = (
         f"🖥 {bold('Host')}     {code(cpu)}\n"
         f"⚙️ {bold('Compute')}  {code(str(cores))} vCPU · {code(str(threads))} threads\n"
         f"🧠 {bold('RAM')}      {code(str(free))} free / {code(str(ram))}\n"
@@ -92,6 +93,7 @@ def vm_card(p: dict, job: dict) -> str:
         f"📈 {bold('Load')}     {code(str(load))}\n"
         f"⏳ {bold('Time')}     {code(fmt_time(elapsed))} elapsed · {code(fmt_time(ttl_left))} left"
     )
+    return blockquote(content)
 
 def stage_panel(p: dict) -> str:
     """Dynamic progress bar and status panel."""
@@ -118,7 +120,7 @@ def stage_panel(p: dict) -> str:
         dead = p.get("vps_dead", 0)
         lines.append(f"🌐 Probed {code(str(tested))} · Valid: {code(str(valid))} · Dead: {code(str(dead))}")
 
-    return "\n".join(lines)
+    return blockquote("\n".join(lines))
 
 def live_text(job: dict) -> str:
     """Builds the comprehensive live dashboard card."""

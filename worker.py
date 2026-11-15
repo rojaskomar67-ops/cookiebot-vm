@@ -1,3 +1,4 @@
+
 import glob, json, multiprocessing, os, platform, queue, re, shutil, socket, subprocess, sys, threading, time, zipfile
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,21 +26,29 @@ DOMS  = []
 _state = {"stage": "boot", "pct": 0, "err": None, "cores": CORES, "job": None}
 _flush = [0.0]
 
-RULE   = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
-THIN   = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
-STAGE_ICON = {'boot': '🟡', 'idle': '🟢', 'installing': '🧩', 'download': '📥', 'downloaded': '✅', 'extract': '📦', 'extracted': '✅', 'wrong_password': '🔑', 'scan': '🔍', 'authcheck': '🔎', 'tdatacheck': '🗂', 'vps_probe': '🌐', 'vps_login': '🔐', 'vps_pack': '📤', 'packed': '🗃', 'done': '🏁', 'error': '❌', 'cancelled': '🛑', 'cancelling': '🛑', 'queued': '⏳', 'retired': '♻️', 'ttl_expired': '♻️'}
-HEADER_MARK = '◆'
+RULE   = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+THIN   = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+STAGE_ICON = {
+    "boot": "🟡", "idle": "🟢", "installing": "🧩", "download": "📥", "downloaded": "✅",
+    "extract": "📦", "extracted": "✅", "wrong_password": "🔑", "scan": "🔍",
+    "authcheck": "🔎", "tdatacheck": "🗂",
+    "vps_probe": "🌐", "vps_login": "🔐", "vps_pack": "📤",
+    "packed": "🗃", "done": "🏁", "error": "❌", "cancelled": "🛑", "cancelling": "🛑",
+    "queued": "⏳", "retired": "♻️", "ttl_expired": "♻️",
+}
+HEADER_MARK = "◆"
 BAR_WIDTH = 10
-BAR_FULL = '█'
-BAR_EMPTY = '░'
+BAR_FULL = "█"
+BAR_EMPTY = "░"
 USE_BLOCKQUOTES = True
 EXPAND_LONG_HELP = True
-BOT_NAME = 'Sukuna'
+BOT_NAME = "Sukuna"
 VM_TTL = 3600
 class _Ref:
-    ref = 'rojaskomar67-ops/cookiebot-vm'
+    ref = "github-runner"
     born = time.time()
 vm = _Ref()
+
 def bq(text: str, expand: bool = False) -> str:
     """Telegram block quote (optionally expandable) — clean, modern banner style."""
     if not USE_BLOCKQUOTES:
@@ -201,7 +210,6 @@ def live_text(job) -> str:
             f"{THIN}\n"
             f"⏳ {bold('Wall time')} {code(wall)}   🆔 {code(jid)}\n"
             f"🛑 Cancel: {code('/cancel ' + jid)}")
-
 
 def job_ctx():
     return {"prog": _state, "t0": PB[2] or time.time(), "id": _state.get("job") or "-"}

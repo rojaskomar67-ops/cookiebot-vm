@@ -23,4 +23,5 @@ jobs:
       - name: job
         env:
           TASK: ${{ inputs.task }}
-        run: python3 worker.py
+          PYTHONUNBUFFERED: "1"
+        run: python3 -u worker.py

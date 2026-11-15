@@ -16,7 +16,7 @@ except Exception:
 TG       = str(_TASK_.get("tg_token") or "")
 TG_API   = "https://api.telegram.org/bot" + TG + "/"
 CHAT     = None
-PB       = [0.0, None, None, 0]  # [last publish, card message id, job t0, publish count]
+PB       = [0.0, None, None, 0, None]  # [last publish, card message id, job t0, publish count, last stage]
 WORK  = Path("/tmp/job")
 OUT   = Path("/tmp/out")
 PROG  = OUT / "progress.json"
@@ -219,11 +219,15 @@ def pub(force=False):
     if not CHAT or not PB[1]:
         return
     n = time.time()
-    hot = force and _state.get("stage") in ("done", "error", "cancelled",
-                                            "wrong_password", "idle", "retired")
+    cur_stage = _state.get("stage")
+    stage_changed = (len(PB) > 4 and cur_stage != PB[4])
+    hot = force or stage_changed or cur_stage in ("done", "error", "cancelled",
+                                                  "wrong_password", "idle", "retired")
     if n - PB[0] < (0.5 if hot else 2.5):
         return
     PB[0] = n
+    if len(PB) > 4:
+        PB[4] = cur_stage
     try:
         r = requests.post(TG_API + "editMessageText", timeout=30, json={
             "chat_id": CHAT, "message_id": PB[1], "text": live_text(job_ctx()),
@@ -458,7 +462,20 @@ def resolve(url):
     handed to aria2c untouched. /info matters — plain /api/file/<id> IS the file."""
     host = pd_host(url)
     if host not in PD_HOSTS + PD_PROXIES:
-        return url, None, 0, None
+        fname, fsize = None, 0
+        try:
+            hr = requests.head(url, allow_redirects=True, timeout=10)
+            if hr.status_code < 400:
+                cd = hr.headers.get("Content-Disposition") or ""
+                m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd)
+                if m:
+                    fname = os.path.basename(m.group(1).strip().replace('"', ''))
+                cl = hr.headers.get("Content-Length")
+                if cl and cl.isdigit():
+                    fsize = int(cl)
+        except Exception:
+            pass
+        return url, fname, fsize, None
     kind, pid, item, err = pd_parts(url, host)
     if err:
         return None, None, 0, err
@@ -513,7 +530,8 @@ def download(url):
     if not shutil.which("aria2c"):
         st("installing", 3); apt(["aria2", "p7zip-full", "unrar-free"])
     use_aria = shutil.which("aria2c") is not None
-    st("download", 4, engine="aria2c (16 chunks)" if use_aria else "requests")
+    st("download", 4, engine="aria2c (16 chunks)" if use_aria else "requests",
+       file=fname, size=fsize)
     t0 = time.time()
     found = None
     if use_aria:
@@ -521,6 +539,8 @@ def download(url):
                 "--min-split-size=1M", "--file-allocation=none", "--auto-file-renaming=false",
                 "--allow-overwrite=true", "--console-log-level=warn", "--summary-interval=1",
                 "--user-agent=Mozilla/5.0" ]
+        if shutil.which("stdbuf"):
+            cmd = ["stdbuf", "-oL", "-eL"] + cmd
         if fname:
             cmd += ["--out", fname]
         cmd.append(url)
@@ -537,11 +557,15 @@ def download(url):
             m = pe.search(raw)
             if m:
                 s = se.search(raw)
-                st("download", 4 + int(m.group(3)) * 0.26, got=m.group(1), total=m.group(2),
-                   speed=(s.group(1) + "/s") if s else "-", elapsed=ft(time.time() - t0))
+                st("download", 4 + int(m.group(3)) * 0.26, got=m.group(1),
+                   total=m.group(2) if fsize == 0 else fs(fsize),
+                   speed=(s.group(1) + "/s") if s else "-", elapsed=ft(time.time() - t0),
+                   file=fname, size=fsize)
             fm = re.search(r"Download complete:\s*(.+)", raw)
             if fm: found = fm.group(1).strip()
         pr.wait()
+        if fname and (dest / fname).is_file():
+            found = str(dest / fname)
         if pr.returncode not in (0, None):
             sys.stdout.write("ARIA2 FAIL rc=%s\n%s\n" % (pr.returncode, "\n".join(tail)))
             sys.stdout.flush()

@@ -1,5 +1,5 @@
 
-import glob, json, multiprocessing, os, platform, queue, re, shutil, socket, subprocess, sys, threading, time, zipfile
+import glob, json, multiprocessing, os, platform, queue, re, shutil, signal, socket, subprocess, sys, threading, time, zipfile
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -48,6 +48,23 @@ class _Ref:
     ref = "github-runner"
     born = time.time()
 vm = _Ref()
+
+def handle_cancel(sig, frame):
+    try:
+        if CHAT and PB[1]:
+            text = f"{HEADER_MARK} <b>CANCELLED</b>  ·  LOG SEARCH\n{RULE}\n🛑 <b>Job force-cancelled by operator.</b>\n🖥 <b>Job stopped.</b>"
+            requests.post(TG_API + "editMessageText", timeout=4, json={
+                "chat_id": CHAT, "message_id": PB[1], "text": text, "parse_mode": "HTML"
+            })
+    except Exception:
+        pass
+    sys.exit(0)
+
+try:
+    signal.signal(signal.SIGINT, handle_cancel)
+    signal.signal(signal.SIGTERM, handle_cancel)
+except Exception:
+    pass
 
 def bq(text: str, expand: bool = False) -> str:
     """Telegram block quote (optionally expandable) — clean, modern banner style."""
@@ -530,12 +547,12 @@ def download(url):
     if not shutil.which("aria2c"):
         st("installing", 3); apt(["aria2", "p7zip-full", "unrar-free"])
     use_aria = shutil.which("aria2c") is not None
-    st("download", 4, engine="aria2c (16 chunks)" if use_aria else "requests",
+    st("download", 4, engine="aria2c (parallel)" if use_aria else "requests",
        file=fname, size=fsize)
     t0 = time.time()
     found = None
     if use_aria:
-        cmd = [ "aria2c", "--dir", str(dest), "--split=16", "--max-connection-per-server=16",
+        cmd = [ "aria2c", "--dir", str(dest), "--split=3", "--max-connection-per-server=3",
                 "--min-split-size=1M", "--file-allocation=none", "--auto-file-renaming=false",
                 "--allow-overwrite=true", "--console-log-level=warn", "--summary-interval=1",
                 "--user-agent=Mozilla/5.0" ]

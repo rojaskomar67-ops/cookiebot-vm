@@ -550,12 +550,14 @@ def download(url):
     if not shutil.which("aria2c"):
         st("installing", 3); apt(["aria2", "p7zip-full", "unrar-free"])
     use_aria = shutil.which("aria2c") is not None
-    st("download", 4, engine="aria2c (16-stream falloc)" if use_aria else "fast-parallel",
-       file=fname, size=fsize)
+    is_internal = ("/dl/" in url) or ("trycloudflare.com" in url) or ("107.149.158.183" in url)
+    split_count = 4 if is_internal else 16
+    engine_name = "aria2c (%d-stream falloc)" % split_count if use_aria else "fast-parallel"
+    st("download", 4, engine=engine_name, file=fname, size=fsize)
     t0 = time.time()
     found = None
     if use_aria:
-        cmd = [ "aria2c", "--dir", str(dest), "--split=16", "--max-connection-per-server=16",
+        cmd = [ "aria2c", "--dir", str(dest), f"--split={split_count}", f"--max-connection-per-server={split_count}",
                 "--min-split-size=1M", "--file-allocation=falloc",
                 "--disk-cache=64M", "--socket-recv-buffer-size=2M",
                 "--stream-piece-selector=default", "--piece-length=1M",
@@ -666,7 +668,8 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None):
             except Exception: pass
 
     if range_supported and total_size > (4 * 1024 * 1024):
-        workers = min(16, max(4, (os.cpu_count() or 4) * 2))
+        is_internal = ("/dl/" in final_url) or ("trycloudflare.com" in final_url) or ("107.149.158.183" in final_url)
+        workers = 4 if is_internal else min(16, max(4, (os.cpu_count() or 4) * 2))
         chunk_size = total_size // workers
         downloaded = [0]
         lock = threading.Lock()

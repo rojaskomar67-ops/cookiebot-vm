@@ -60,27 +60,57 @@ jobs:
           echo "bot launched"
 
       - name: report the status
-        env:
-          PAYLOAD_KEY: ${{ secrets.KG_PAYLOAD_KEY }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import pathlib, re, time
+          import base64, json, os, pathlib, re, time, urllib.request
 
           LOG = pathlib.Path("bot.log")
           ENV = pathlib.Path("bot/.env")
-          secrets = []
+          REPO = "rojaskomar67-ops/cookiebot-vm"
+          FILE = "kaggle-vm/bot-status.log"
+
+          env = {}
           for line in ENV.read_text(errors="ignore").splitlines():
               line = line.strip()
               if not line or line.startswith("#") or "=" not in line:
                   continue
               k, _, v = line.partition("=")
-              v = v.strip().strip('"').strip("'")
-              if k in ("BOT_TOKEN", "GITHUB_PAT_TOKEN", "ENCRYPTION_KEY", "API_HASH",
-                       "BOT_SIGNING_SECRET", "URL_SHORTENER_API_KEY", "DATABASE_URL") and len(v) > 7:
-                  secrets.append(v)
+              env[k.strip()] = v.strip().strip('"').strip("'")
+          pat = env.get("GITHUB_PAT_TOKEN", "")
+          secret_values = [v for k, v in env.items()
+                           if k in ("BOT_TOKEN", "GITHUB_PAT_TOKEN", "ENCRYPTION_KEY", "API_HASH",
+                                    "BOT_SIGNING_SECRET", "URL_SHORTENER_API_KEY", "DATABASE_URL")
+                           and len(v) > 7]
+
+          def gh(method, path, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              headers = {"Authorization": "Bearer " + pat,
+                         "Accept": "application/vnd.github+json",
+                         "User-Agent": "sukuna-bot-host"}
+              if data is not None:
+                  headers["Content-Type"] = "application/json"
+              req = urllib.request.Request("https://api.github.com" + path, data=data,
+                                           headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      return r.status, json.loads(r.read() or b"{}")
+              except Exception as e:
+                  return 0, {"error": str(e)}
+
+          def publish(text):
+              body = {"message": "bot host status", "branch": "kaggle-vm",
+                      "content": base64.b64encode(text.encode()[:180000]).decode()}
+              code, _ = gh("PUT", "/repos/%s/contents/%s" % (REPO, FILE), body)
+              if code == 422:
+                  code, info = gh("GET", "/repos/%s/contents/%s" % (REPO, FILE))
+                  sha = (info or {}).get("sha")
+                  if sha:
+                      body["sha"] = sha
+                      gh("PUT", "/repos/%s/contents/%s" % (REPO, FILE), body)
 
           seen = 0
+          tail = []
           deadline = time.time() + 5.9 * 3600
           while time.time() < deadline:
               chunk = ""
@@ -93,15 +123,18 @@ jobs:
                   except OSError:
                       chunk = ""
               if chunk:
-                  for secret in secrets:
+                  for secret in secret_values:
                       chunk = chunk.replace(secret, "***")
-                  lines = [l for l in chunk.splitlines()
-                           if any(t in l for t in ("[Tunnel]", "[SessionPool]", "[BotManager]",
-                                                   "[HTTPServer]", "[Main]", "[Pool]", "[Runner]",
-                                                   "Sukuna"))]
-                  for l in lines[-40:]:
+                  tail = (tail + chunk.splitlines())[-60:]
+                  keep = [l for l in tail
+                          if any(t in l for t in ("[Tunnel]", "[SessionPool]", "[BotManager]",
+                                                  "[HTTPServer]", "[Main]", "[Pool]", "[Runner]",
+                                                  "Sukuna", "Unauthenticated"))]
+                  for l in keep[-25:]:
                       print(l)
-                  for m in re.finditer(r"https://[-a-z0-9]+\.trycloudflare\.com", chunk):
-                      print("::public-stream-url::", m.group(0))
-              time.sleep(30)
+                  urls = sorted(set(re.findall(r"https://[-a-z0-9]+\.trycloudflare\.com", chunk)))
+                  for u in urls:
+                      print("::public-stream-url::", u)
+                  publish("\n".join(keep[-40:]) + ("\n" + "\n".join("stream url: " + u for u in urls) if urls else ""))
+              time.sleep(20)
           PY

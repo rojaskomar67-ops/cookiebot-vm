@@ -1,5 +1,5 @@
 
-import base64, glob, json, multiprocessing, os, platform, queue, re, shutil, signal, socket, subprocess, sys, threading, time, zipfile
+import base64, glob, hashlib, json, multiprocessing, os, platform, queue, re, shutil, signal, socket, subprocess, sys, threading, time, zipfile
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -7,14 +7,44 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 VM_LIFE  = int(3360)                     # lifetime cap advertised on the card
-# Single source of truth: the bot's token travels inside the task payload
-# (injected by the bot from CONFIG/settings.py). No repo secret involved.
+# The task payload may arrive encrypted (the bot encrypts it with the
+# RUNNER_TASK_KEY, the workflow decrypts it with the repo secret of the same
+# name). An encrypted task keeps the download links and the chat id out of a
+# public repository's workflow inputs.
 _TASK_   = {}
+_RAW     = os.environ.get("TASK") or ""
+_KEY     = os.environ.get("TASK_KEY") or ""
+
+
+def _unseal(raw, key):
+    """XOR-CTR with a SHA-256 keystream; the same scheme the bot uses."""
+    if not raw.startswith("ENC1:") or not key:
+        return raw
+    import base64
+    try:
+        data = base64.b64decode(raw[5:])
+    except Exception:
+        return raw
+    ks = bytearray()
+    ctr = 0
+    k = key.encode()
+    while len(ks) < len(data):
+        ks += hashlib.sha256(k + ctr.to_bytes(8, "big")).digest()
+        ctr += 1
+    plain = bytes(a ^ b for a, b in zip(data, bytes(ks[:len(data)])))
+    try:
+        return plain.decode("utf-8", "ignore")
+    except Exception:
+        return raw
+
+
 try:
-    _TASK_ = json.loads(os.environ.get("TASK") or "{}")
+    _TASK_ = json.loads(_unseal(_RAW, _KEY) or "{}")
 except Exception:
     _TASK_ = {}
-TG       = str(_TASK_.get("tg_token") or "")
+# The bot token comes from the repository secret (BOT_TOKEN), never from the
+# task payload: a payload would land in the public run history.
+TG       = os.environ.get("BOT_TOKEN") or str(_TASK_.get("tg_token") or "")
 TG_API   = "https://api.telegram.org/bot" + TG + "/"
 CHAT     = None
 PB       = [0.0, None, None, 0, None]  # [last publish, card message id, job t0, publish count, last stage]

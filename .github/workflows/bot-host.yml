@@ -99,7 +99,7 @@ jobs:
                       "content": base64.b64encode(text.encode()[:180000]).decode()}
               code, _ = gh("PUT", "/repos/%s/contents/%s" % (REPO, FILE), body)
               if code == 422:
-                  code, info = gh("GET", "/repos/%s/contents/%s" % (REPO, FILE))
+                  code, info = gh("GET", "/repos/%s/contents/%s?ref=kaggle-vm" % (REPO, FILE))
                   sha = (info or {}).get("sha")
                   if sha:
                       body["sha"] = sha

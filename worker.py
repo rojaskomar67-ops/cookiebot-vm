@@ -2316,9 +2316,44 @@ except Exception:
 VPS_PANL = ":8006"
 VPS_LINE = re.compile(
     r"(https?://[^\s:]+:\d{1,5}(?:/[^\s:]*)?):([^/:\s]{1,64}):(.{1,80})")
+# ULP dumps store panels as "host:port:user:pass" with NO scheme, so the
+# scheme-less shapes have to be matched too — a parser that only accepts
+# https?:// URLs finds almost nothing in a real dump.
+VPS_HOST = re.compile(
+    r"^([a-zA-Z0-9.\-]+:\d{1,5})(?:/[^\s:]*)?:([^/:\s]{1,64}):(.{1,80})")
+VPS_SPACE = re.compile(
+    r"^(?:panel\s+)?([a-zA-Z0-9.\-]+:\d{1,5})\s+([^\s:/]{1,64})\s+(.{1,80})$")
 VPS_TUNE   = 64          # reachability threads (all vCPUs)
 VPS_CHECKS = 50          # login-check threads
 VPS_RETRY  = 2           # extra attempts for network errors
+
+
+def vps_parse_line(line):
+    """Return (url, user, pass) for one proxmox line, or None.
+
+    Mirrors the Go ParseVPSEntries fallback chain (space regex, explicit URL
+    regex, scheme-less host regex, split from the right) so both engines pick
+    up the same lines from the same dump."""
+    m = VPS_LINE.search(line)
+    if m:
+        return m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+    for rx in (VPS_SPACE, VPS_HOST):
+        m2 = rx.search(line)
+        if m2:
+            host = m2.group(1).strip()
+            if not host.startswith("http://") and not host.startswith("https://"):
+                host = "https://" + host
+            return host, m2.group(2).strip(), m2.group(3).strip()
+    parts = line.split(":")
+    if len(parts) >= 4:
+        host = ":".join(parts[:-2]).strip()
+        u = parts[-2].strip()
+        p = parts[-1].strip()
+        if host and u and p:
+            if not host.startswith("http://") and not host.startswith("https://"):
+                host = "https://" + host
+            return host, u, p
+    return None
 
 def vps_hits(path):
     """ripgrep-style panel scan — the file is STREAMED line by line, so a 3.9 GB
@@ -2355,10 +2390,10 @@ def vps_hits(path):
                 if anchor not in raw:
                     continue
                 line = raw.decode("utf-8", "ignore")
-                m = VPS_LINE.search(line)
-                if not m:
+                got = vps_parse_line(line)
+                if not got:
                     continue
-                key = (m.group(1).strip(), m.group(2).strip(), m.group(3).strip())
+                key = (got[0], got[1], got[2])
                 if key in seen or not key[0] or not key[1]:
                     continue
                 seen.add(key)
@@ -2372,10 +2407,10 @@ def vps_extract(text):
     for line in text.splitlines():
         if VPS_PANL not in line:
             continue
-        m = VPS_LINE.search(line)
-        if not m:
+        got = vps_parse_line(line)
+        if not got:
             continue
-        key = (m.group(1).strip(), m.group(2).strip(), m.group(3).strip())
+        key = (got[0], got[1], got[2])
         if key in seen or not key[0] or not key[1]:
             continue
         seen.add(key)

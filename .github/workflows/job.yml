@@ -21,5 +21,7 @@ jobs:
       - name: job
         env:
           TASK: ${{ inputs.task }}
+          TASK_KEY: ${{ secrets.RUNNER_TASK_KEY }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           PYTHONUNBUFFERED: "1"
         run: python3 -u worker.py

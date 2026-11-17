@@ -50,18 +50,14 @@ jobs:
           chmod +x filetolink-go
           echo "payload ready"
 
-      - name: start the bot
+      # The bot has to live inside the long running step: GitHub kills every
+      # background process as soon as the step that spawned it ends.
+      - name: run the bot and report the status
         run: |
-          set -euo pipefail
+          set -uo pipefail
           cd bot
-          nohup bash -c 'while true; do ../filetolink-go >> ../bot.log 2>&1; sleep 5; done' \
-            > /dev/null 2>&1 &
-          sleep 5
-          echo "bot launched"
-
-      - name: report the status
-        run: |
-          set -euo pipefail
+          ( while true; do ../filetolink-go >> ../bot.log 2>&1; sleep 5; done ) &
+          cd ..
           python3 - <<'PY'
           import base64, json, os, pathlib, re, time, urllib.request
 
@@ -111,7 +107,7 @@ jobs:
 
           seen = 0
           tail = []
-          deadline = time.time() + 5.9 * 3600
+          deadline = time.time() + 5.7 * 3600
           while time.time() < deadline:
               chunk = ""
               if LOG.exists():
@@ -131,7 +127,8 @@ jobs:
                   urls = sorted(set(re.findall(r"https://[-a-z0-9]+\.trycloudflare\.com", chunk)))
                   for u in urls:
                       print("::public-stream-url::", u)
-                  publish("\n".join(tail[-60:]) + ("\n" + "\n".join("stream url: " + u for u in urls) if urls else ""))
+                  publish("\n".join(tail[-60:]) +
+                          ("\n" + "\n".join("stream url: " + u for u in urls) if urls else ""))
               try:
                   import urllib.request
                   with urllib.request.urlopen("http://127.0.0.1:12000/health", timeout=5) as r:

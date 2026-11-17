@@ -569,15 +569,19 @@ def download(url):
         st("installing", 3); apt(["aria2", "p7zip-full", "unrar-free"])
     use_aria = shutil.which("aria2c") is not None
     is_internal = ("/dl/" in url) or ("trycloudflare.com" in url) or ("107.149.158.183" in url)
-    split_count = 4 if is_internal else 16
+    # Relay links travel through the tunnel, and the edge throttles every
+    # connection on its own: four connections cap the whole transfer at a
+    # few MB/s. Many connections are what buys the bandwidth here.
+    split_count = 32 if is_internal else 16
     engine_name = "aria2c (%d-stream falloc)" % split_count if use_aria else "fast-parallel"
     st("download", 4, engine=engine_name, file=fname, size=fsize)
     t0 = time.time()
     found = None
     if use_aria:
         cmd = [ "aria2c", "--dir", str(dest), f"--split={split_count}", f"--max-connection-per-server={split_count}",
-                "--min-split-size=1M", "--file-allocation=falloc",
-                "--disk-cache=64M", "--socket-recv-buffer-size=2M",
+                "--file-allocation=falloc",
+                "--disk-cache=64M", "--socket-recv-buffer-size=4M",
+                "--min-split-size=256K",
                 "--stream-piece-selector=default", "--piece-length=1M",
                 "--optimize-concurrent-downloads=true", "--auto-file-renaming=false",
                 "--allow-overwrite=true", "--console-log-level=warn", "--summary-interval=1",
@@ -691,7 +695,10 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
 
     if range_supported and total_size > (4 * 1024 * 1024):
         is_internal = ("/dl/" in final_url) or ("trycloudflare.com" in final_url) or ("107.149.158.183" in final_url)
-        workers = 4 if is_internal else min(16, max(4, (os.cpu_count() or 4) * 2))
+        # Internal (relay) links: many parallel connections. When the edge
+        # in front of the relay throttles per connection, the number of
+        # connections is what decides the total speed.
+        workers = 32 if is_internal else min(16, max(4, (os.cpu_count() or 4) * 2))
         chunk_size = total_size // workers
         downloaded = [0]
         lock = threading.Lock()

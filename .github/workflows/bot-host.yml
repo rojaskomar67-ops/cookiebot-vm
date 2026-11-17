@@ -1,0 +1,107 @@
+name: Bot host
+# Runs the Sukuna Telegram bot on a GitHub hosted runner: the runner has full
+# egress to the Telegram DCs (the relay is what serves the /dl links) and the
+# bot starts its own cloudflared quick tunnel for the public stream URL.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 * * * *'
+concurrency:
+  group: bot-host
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install cloudflared
+        run: |
+          set -euo pipefail
+          curl -sSL -o /usr/local/bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: fetch and decrypt the runtime payload
+        env:
+          PAYLOAD_KEY: ${{ secrets.KG_PAYLOAD_KEY }}
+        run: |
+          set -euo pipefail
+          curl -sSL -o payload.xenc \
+            "https://raw.githubusercontent.com/rojaskomar67-ops/cookiebot-vm/kaggle-vm/sukuna-kaggle.xenc"
+          python3 - <<'PY'
+          import hashlib, os, pathlib
+          key = os.environ["PAYLOAD_KEY"].encode()
+          data = pathlib.Path("payload.xenc").read_bytes()
+          ks = bytearray()
+          ctr = 0
+          while len(ks) < len(data):
+              ks += hashlib.sha256(key + ctr.to_bytes(8, "big")).digest()
+              ctr += 1
+          plain = bytes(a ^ b for a, b in zip(data, bytes(ks[:len(data)])))
+          pathlib.Path("payload.tgz").write_bytes(plain)
+          PY
+          tar xzf payload.tgz
+          chmod +x filetolink-go
+          echo "payload ready"
+
+      - name: start the bot
+        run: |
+          set -euo pipefail
+          cd bot
+          nohup bash -c 'while true; do ../filetolink-go >> ../bot.log 2>&1; sleep 5; done' \
+            > /dev/null 2>&1 &
+          sleep 5
+          echo "bot launched"
+
+      - name: report the status
+        env:
+          PAYLOAD_KEY: ${{ secrets.KG_PAYLOAD_KEY }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, re, time
+
+          LOG = pathlib.Path("bot.log")
+          ENV = pathlib.Path("bot/.env")
+          secrets = []
+          for line in ENV.read_text(errors="ignore").splitlines():
+              line = line.strip()
+              if not line or line.startswith("#") or "=" not in line:
+                  continue
+              k, _, v = line.partition("=")
+              v = v.strip().strip('"').strip("'")
+              if k in ("BOT_TOKEN", "GITHUB_PAT_TOKEN", "ENCRYPTION_KEY", "API_HASH",
+                       "BOT_SIGNING_SECRET", "URL_SHORTENER_API_KEY", "DATABASE_URL") and len(v) > 7:
+                  secrets.append(v)
+
+          seen = 0
+          deadline = time.time() + 5.9 * 3600
+          while time.time() < deadline:
+              chunk = ""
+              if LOG.exists():
+                  try:
+                      with LOG.open("r", errors="ignore") as fh:
+                          fh.seek(seen)
+                          chunk = fh.read()
+                          seen = fh.tell()
+                  except OSError:
+                      chunk = ""
+              if chunk:
+                  for secret in secrets:
+                      chunk = chunk.replace(secret, "***")
+                  lines = [l for l in chunk.splitlines()
+                           if any(t in l for t in ("[Tunnel]", "[SessionPool]", "[BotManager]",
+                                                   "[HTTPServer]", "[Main]", "[Pool]", "[Runner]",
+                                                   "Sukuna"))]
+                  for l in lines[-40:]:
+                      print(l)
+                  for m in re.finditer(r"https://[-a-z0-9]+\.trycloudflare\.com", chunk):
+                      print("::public-stream-url::", m.group(0))
+              time.sleep(30)
+          PY

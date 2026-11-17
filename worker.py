@@ -294,12 +294,12 @@ def pub(force=False):
     if len(PB) > 4:
         PB[4] = cur_stage
     try:
-        r = requests.post(TG_API + "editMessageText", timeout=30, json={
+        r = tg_post(TG_API + "editMessageText", tries=3, timeout=30, json={
             "chat_id": CHAT, "message_id": PB[1], "text": live_text(job_ctx()),
             "parse_mode": "HTML"})
-        if r.status_code == 200:
+        if r is not None and getattr(r, "status_code", 0) == 200:
             PB[3] += 1
-        elif "message is not modified" not in (r.text or ""):
+        elif r is not None and "message is not modified" not in (getattr(r, "text", "") or ""):
             sys.stdout.write("tg edit %s: %s\n" % (r.status_code, r.text[:150])); sys.stdout.flush()
     except Exception as e:
         sys.stdout.write("tg edit failed: %s\n" % e); sys.stdout.flush()
@@ -309,9 +309,14 @@ def new_card(text):
     if not CHAT:
         return None
     try:
-        r = requests.post(TG_API + "sendMessage", timeout=30, json={
+        r = tg_post(TG_API + "sendMessage", timeout=30, json={
             "chat_id": CHAT, "text": text, "parse_mode": "HTML"})
-        return (r.json().get("result") or {}).get("message_id")
+        if r is None:
+            return None
+        try:
+            return (r.json().get("result") or {}).get("message_id")
+        except Exception:
+            return None
     except Exception as e:
         sys.stdout.write("tg send failed: %s\n" % e); sys.stdout.flush()
         return None
@@ -325,19 +330,65 @@ def report(payload, tries=1):
 def upload(name, caption):
     """Send a result file straight from the VM to the user's chat."""
     if not TG or not CHAT: return False
-    try:
-        with open(name, "rb") as fh:
-            # requests cannot mix json= and files=: the fields must travel as multipart data.
-            r = requests.post(TG_API + "sendDocument",
-                              data={"chat_id": CHAT, "caption": caption,
-                                    "parse_mode": "HTML"},
-                              files={"document": (name.split("/")[-1], fh)}, timeout=300)
-        if r.status_code != 200:
-            sys.stdout.write("tg send %s: %s\n" % (name, r.text[:200])); sys.stdout.flush()
-        return r.status_code == 200
-    except Exception as e:
-        sys.stdout.write("tg send error: %s\n" % e); sys.stdout.flush()
-        return False
+    last = None
+    for attempt in range(6):
+        try:
+            with open(name, "rb") as fh:
+                # requests cannot mix json= and files=: the fields must travel as multipart data.
+                r = tg_post(TG_API + "sendDocument", tries=1,
+                            data={"chat_id": CHAT, "caption": caption,
+                                  "parse_mode": "HTML"},
+                            files={"document": (name.split("/")[-1], fh)}, timeout=300)
+            if r is not None and r.status_code == 200:
+                return True
+            last = r
+            sys.stdout.write("tg send %s: %s (attempt %d/6)\n"
+                             % (name, getattr(r, "text", r)[:200], attempt + 1))
+            sys.stdout.flush()
+        except Exception as e:
+            last = e
+            sys.stdout.write("tg send error: %s (attempt %d/6)\n" % (e, attempt + 1))
+            sys.stdout.flush()
+        time.sleep(min(5 * (attempt + 1), 30))
+    return False
+
+def tg_post(url, tries=5, **kw):
+    """POST to the Bot API and retry the failures that are not our fault.
+
+    The API answers 502 or simply times out when Telegram's edge for the
+    runner's address wobbles. A result file must never be lost because of
+    that, so every call is retried with a growing delay."""
+    delay = 4
+    last = None
+    for attempt in range(tries):
+        try:
+            r = requests.post(url, **kw)
+            if r.status_code == 200:
+                return r
+            last = r
+            if r.status_code in (429, 500, 502, 503, 504):
+                sys.stdout.write("tg api %s: %s (retry %d/%d)\n"
+                                 % (url.rsplit("/", 1)[-1], r.text[:140], attempt + 1, tries))
+                sys.stdout.flush()
+                wait = delay
+                try:
+                    ra = int(((r.json() or {}).get("parameters") or {}).get("retry_after") or 0)
+                    if ra:
+                        wait = min(max(ra, delay), 60)
+                except Exception:
+                    pass
+                time.sleep(wait)
+                delay = min(delay * 2, 30)
+                continue
+            return r
+        except Exception as e:
+            last = e
+            sys.stdout.write("tg api error: %s (retry %d/%d)\n" % (e, attempt + 1, tries))
+            sys.stdout.flush()
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+    return last
+
 
 def ft(s):
     s = int(max(0, s or 0))
@@ -1194,21 +1245,27 @@ def deliver_auth(auths):
                       f"archive, so the bot-side proxy check is skipped for this job")
         sent_parts, _ = ship(zp, auth_cap)
         return sent_parts > 0, None
-    try:
-        with open(zp, "rb") as fh:
-            r = requests.post(TG_API + "sendDocument",
-                              data={"chat_id": CHAT, "caption": cap,
-                                    "parse_mode": "HTML"},
-                              files={"document": (zp.name, fh)}, timeout=300)
-        if r.status_code == 200:
-            fid = (((r.json().get("result") or {}).get("document") or {})
-                   .get("file_id"))
-            return True, fid
-        sys.stdout.write("tg send %s: %s\n" % (zp.name, r.text[:200]))
-        sys.stdout.flush()
-        return False, None
-    except Exception as e:
-        sys.stdout.write("tg send error: %s\n" % e); sys.stdout.flush()
+    last = None
+    for attempt in range(5):
+        try:
+            with open(zp, "rb") as fh:
+                r = tg_post(TG_API + "sendDocument", tries=1,
+                            data={"chat_id": CHAT, "caption": cap,
+                                  "parse_mode": "HTML"},
+                            files={"document": (zp.name, fh)}, timeout=300)
+            if r is not None and r.status_code == 200:
+                fid = (((r.json().get("result") or {}).get("document") or {})
+                       .get("file_id"))
+                return True, fid
+            last = r
+            sys.stdout.write("tg send %s: %s (attempt %d/5)\n"
+                             % (zp.name, getattr(r, "text", r)[:200], attempt + 1))
+            sys.stdout.flush()
+        except Exception as e:
+            last = e
+            sys.stdout.write("tg send error: %s (attempt %d/5)\n" % (e, attempt + 1))
+            sys.stdout.flush()
+        time.sleep(min(5 * (attempt + 1), 25))
         return False, None
 
 # ── auth.json proxy check (did the user request it in step 4?) ─────────────
@@ -2060,7 +2117,7 @@ def finish(task, stage, **extra):
         # 1. Delete the live console card message immediately
         if CHAT and PB[1]:
             try:
-                r = requests.post(TG_API + "deleteMessage", timeout=10, json={
+                r = tg_post(TG_API + "deleteMessage", tries=3, timeout=10, json={
                     "chat_id": CHAT, "message_id": PB[1]
                 })
                 sys.stdout.write("Live card %s deleted, rc=%s\n" % (PB[1], r.status_code))
@@ -2132,7 +2189,7 @@ def finish(task, stage, **extra):
                         f"🧹 <b>Disk:</b> Wiped clean",
                         f"⏱ <b>Elapsed:</b> <code>{tot_elapsed}</code>",
                     ])
-                requests.post(TG_API + "sendMessage", timeout=15, json={
+                tg_post(TG_API + "sendMessage", tries=5, timeout=15, json={
                     "chat_id": CHAT,
                     "text": "\n".join(lines),
                     "parse_mode": "HTML",

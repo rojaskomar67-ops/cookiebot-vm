@@ -15,4 +15,4 @@
 2026/11/18 21:51:31 [Main] Cloudflare tunnel ready: https://fifth-entrance-mercy-ahead.trycloudflare.com
 2026/11/18 21:51:33 [Bot] login attempt 1/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
 2026/11/18 21:51:46 [BotManager] Notice: timeout waiting for bot startup
-stream url: https://fifth-entrance-mercy-ahead.trycloudflare.com
+2026/11/18 21:52:03 [Bot] login attempt 2/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s

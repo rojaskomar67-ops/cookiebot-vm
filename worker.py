@@ -723,6 +723,16 @@ def download(url):
             sys.stdout.write("ARIA2 FAIL rc=%s, activating fast parallel engine\n" % pr.returncode)
             sys.stdout.flush()
             found = fast_parallel_dl(url, dest, fname, fsize, t0)
+            if not found:
+                # The fallback could not complete the file either. The file
+                # aria2c left behind has the right length but holes in it, so
+                # it must not reach the scanner.
+                for stale in (dest / fname,) if fname else ():
+                    try:
+                        stale.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                return None
     else:
         found = fast_parallel_dl(url, dest, fname, fsize, t0)
     if not found or not os.path.isfile(found):
@@ -809,21 +819,36 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
         last_tick = [time.time()]
 
         def worker_fetch(w_idx, start, end):
+            """Fetch one segment, resuming from where it stopped.
+
+            A segment that ends early must never be silently accepted: the
+            file is preallocated to its full length, so the bytes that were
+            never written stay as zeros and the scan that follows sees a
+            file with holes in it. Every early end is therefore retried from
+            the last byte that actually arrived, and the segment is only
+            complete when the last byte is there.
+            """
             curr = start
-            retries = 3
-            while curr <= end and retries > 0:
-                if stop(): return
+            attempts = 0
+            while curr <= end:
+                attempts += 1
+                if attempts > 20:
+                    break
+                if stop(): return False
                 try:
                     w_req = urllib.request.Request(final_url, headers={
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
                         'Range': f'bytes={curr}-{end}',
                         'Accept': '*/*'
                     })
-                    with urllib.request.urlopen(w_req, timeout=45) as r:
+                    with urllib.request.urlopen(w_req, timeout=180) as r:
                         while curr <= end:
-                            if stop(): return
+                            if stop(): return False
                             chunk = r.read(1024 * 1024)
-                            if not chunk: break
+                            if not chunk:
+                                # The stream ended early. Break out and retry
+                                # from the last byte that arrived.
+                                break
                             os.pwrite(fd, chunk, curr)
                             curr += len(chunk)
                             with lock:
@@ -842,8 +867,11 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
                                        total=fs(total_size), speed=spd,
                                        elapsed=ft(el), file=out_name, size=total_size)
                 except Exception:
-                    retries -= 1
-                    time.sleep(1)
+                    pass
+                # Either the stream ended early or the request failed: the
+                # segment is incomplete, so resume it from where it stopped.
+                time.sleep(min(0.5 * attempts, 5))
+            return curr > end
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             futs = []
@@ -851,13 +879,29 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
                 st_pos = i * chunk_size
                 en_pos = total_size - 1 if i == workers - 1 else (i + 1) * chunk_size - 1
                 futs.append(ex.submit(worker_fetch, i, st_pos, en_pos))
+            incomplete = []
             for f in concurrent.futures.as_completed(futs):
                 if stop():
                     os.close(fd); return None
-                f.result()
+                try:
+                    if not f.result():
+                        incomplete.append(1)
+                except Exception:
+                    incomplete.append(1)
+            if incomplete:
+                # The file is the right size on disk but parts of it were
+                # never written. Scanning it would report panels that are
+                # simply not in the dump, so the download is a failure.
+                sys.stdout.write("INCOMPLETE DOWNLOAD: %d of %d segments did not "
+                                 "finish (%d of %d bytes written)\n"
+                                 % (len(incomplete), workers, downloaded[0], total_size))
+                sys.stdout.flush()
+                os.close(fd)
+                return None
     else:
         # High-speed buffered stream fallback (2MB buffer)
         req = urllib.request.Request(final_url, headers={'User-Agent': 'Mozilla/5.0'})
+        written = 0
         with urllib.request.urlopen(req, timeout=900) as r:
             curr = 0
             last_tick = time.time()
@@ -868,6 +912,7 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
                 if not chunk: break
                 os.write(fd, chunk)
                 curr += len(chunk)
+                written += len(chunk)
                 if progress_cb is not None:
                     progress_cb(len(chunk))
                     continue
@@ -880,6 +925,12 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
                     st("download", pct_dl, got=fs(curr),
                        total=fs(total_size) if total_size else "?", speed=spd,
                        elapsed=ft(el), file=out_name, size=total_size)
+        if total_size and written != total_size:
+            sys.stdout.write("INCOMPLETE DOWNLOAD: %d of %d bytes written\n"
+                             % (written, total_size))
+            sys.stdout.flush()
+            os.close(fd)
+            return None
 
     os.close(fd)
     return str(tgt)
@@ -3037,6 +3088,14 @@ def batch_download(files):
         path = fast_parallel_dl(src, dest, out_name, fsize, t0, progress_cb=cb)
         if path and os.path.isfile(path):
             paths[idx] = path
+        else:
+            # The download did not complete. The file on disk has the right
+            # length but holes in it, so it must not be scanned.
+            try:
+                (dest / out_name).unlink(missing_ok=True)
+            except Exception:
+                pass
+            errors[idx] = "download incomplete"
         with lock:
             done_files[0] += 1
             got = done_bytes[0]

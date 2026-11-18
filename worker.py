@@ -671,7 +671,7 @@ def download(url):
     except Exception:
         split_count = 0
     if split_count <= 0:
-        split_count = 256 if is_internal else 16
+        split_count = 128 if is_internal else 16
     engine_name = "aria2c (%d-stream falloc)" % split_count if use_aria else "fast-parallel"
     st("download", 4, engine=engine_name, file=fname, size=fsize)
     t0 = time.time()
@@ -812,7 +812,7 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
         except Exception:
             workers = 0
         if workers <= 0:
-            workers = 256 if is_internal else min(16, max(4, (os.cpu_count() or 4) * 2))
+            workers = 128 if is_internal else min(16, max(4, (os.cpu_count() or 4) * 2))
         chunk_size = total_size // workers
         downloaded = [0]
         lock = threading.Lock()
@@ -841,7 +841,7 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
                         'Range': f'bytes={curr}-{end}',
                         'Accept': '*/*'
                     })
-                    with urllib.request.urlopen(w_req, timeout=180) as r:
+                    with urllib.request.urlopen(w_req, timeout=300) as r:
                         while curr <= end:
                             if stop(): return False
                             chunk = r.read(1024 * 1024)

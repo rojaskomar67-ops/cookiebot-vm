@@ -1,20 +1,7 @@
-2026/11/18 10:26:41 ======================================================
-2026/11/18 10:26:41 ⚡ Sukuna ULP / Logs Master Bot (Go + Stream Engine)
-2026/11/18 10:26:41 ======================================================
-2026/11/18 10:26:41 [MongoDB] No DATABASE_URL provided. Running with in-memory fallback for bot settings.
-2026/11/18 10:26:41 [Pool] Starting background warmup for 4 worker bot tokens...
-2026/11/18 10:26:41 [HTTPServer] Warning: failed to parse templates from web/template: html/template: pattern matches no files: `web/template/*.html`
-2026/11/18 10:26:41 [HTTPServer] Listening on 0.0.0.0:12000 (FQDN: work-1-sgzpufvcrbbuqzvw.prod-runtime.all-hands.dev)...
-2026/11/18 10:26:42 [Tunnel] Started cloudflared tunnel process (PID: 2240)
-2026/11/18 10:26:42 [SessionPool] Session authenticated: token ...m-SIvc
-2026/11/18 10:26:42 [SessionPool] Session authenticated: token ...MJD7wI
-2026/11/18 10:26:44 [SessionPool] Session authenticated: token ...QH8yj8
-2026/11/18 10:26:45 [Tunnel] Detected quick tunnel endpoint: https://senior-assists-tex-mighty.trycloudflare.com (verifying DNS & health...)
-2026/11/18 10:26:47 [SessionPool] Session authenticated: token ...1qtAn8
-2026/11/18 10:26:47 [Pool] Multi-token startup complete. 4 active sessions in rotation.
-2026/11/18 10:26:49 [Tunnel] ✅ Active & verified public stream URL: https://senior-assists-tex-mighty.trycloudflare.com
-2026/11/18 10:26:49 [Main] Cloudflare tunnel ready: https://senior-assists-tex-mighty.trycloudflare.com
-2026/11/18 10:26:54 [Bot] Logged in as @Ksksksksk99999_bog_bot (ID: 9150856193)
-2026/11/18 10:26:55 [BotManager] Resolved AccessHash for channel 4339732111: 207857092595055810 (via ChannelsGetChannels)
-2026/11/18 10:26:55 [Runner] GitHub authenticated as rojaskomar67-ops (repo: rojaskomar67-ops/cookiebot-vm)
-stream url: https://senior-assists-tex-mighty.trycloudflare.com
+2026/11/18 16:09:00 ======================================================
+2026/11/18 16:09:00 ⚡ Sukuna ULP / Logs Master Bot (Go + Stream Engine)
+2026/11/18 16:09:00 ======================================================
+2026/11/18 16:09:00 [MongoDB] No DATABASE_URL provided. Running with in-memory fallback for bot settings.
+2026/11/18 16:09:00 [Pool] Starting background warmup for 4 worker bot tokens...
+2026/11/18 16:09:00 [HTTPServer] Warning: failed to parse templates from web/template: html/template: pattern matches no files: `web/template/*.html`
+2026/11/18 16:09:00 [HTTPServer] Listening on 0.0.0.0:12000 (FQDN: work-1-sgzpufvcrbbuqzvw.prod-runtime.all-hands.dev)...

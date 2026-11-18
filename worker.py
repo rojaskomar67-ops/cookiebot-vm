@@ -817,19 +817,23 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
             workers = 32 if is_internal else min(16, max(4, (os.cpu_count() or 4) * 2))
         # The segment size is independent of the number of connections.
         #
-        # One segment per connection makes the segment as large as
-        # file/connections, and with several files pulling at once every
-        # connection only gets a fraction of the relay's capacity - so the
-        # segment takes so long that it outlives the socket timeout and is
-        # fetched again and again. Small segments finish long before that,
-        # while the number of open connections stays where it should be.
+        # One segment per connection (file_size / connections) is the fastest
+        # shape: the relay pipelines the chunks of a request and keeps the
+        # connection busy, and a connection is only opened once. Smaller
+        # segments mean more requests and more per-request overhead, and the
+        # measured aggregate drops with it - 8 MB segments moved 2.32 GB in
+        # the first twelve minutes where 125 MB segments moved 5.81 GB.
+        #
+        # The queue is kept regardless, so a connection that finishes early
+        # picks up the next segment instead of idling.
         try:
             seg_mb = int(os.environ.get("RELAY_SEGMENT_MB") or "")
         except Exception:
             seg_mb = 0
-        if seg_mb <= 0:
-            seg_mb = 8 if is_internal else 32
-        seg_size = seg_mb * 1024 * 1024
+        if seg_mb > 0:
+            seg_size = seg_mb * 1024 * 1024
+        else:
+            seg_size = max(1, total_size // workers)
         downloaded = [0]
         lock = threading.Lock()
         last_tick = [time.time()]

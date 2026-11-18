@@ -3478,10 +3478,10 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     global SPECS
     SPECS = vm_specs()
-    try:
-        task = json.loads(os.environ.get("TASK") or "{}")
-    except Exception:
-        task = {}
+    # The task may arrive encrypted (the bot seals it with the
+    # RUNNER_TASK_KEY, the workflow opens it with the repository secret of the
+    # same name). _TASK_ is the unsealed version.
+    task = dict(_TASK_) if _TASK_ else {}
     if task.get("kind") in ("vps_promox", "vps_check", "vps_virtl", "vps_verify"):
         process_vps(task)
         return

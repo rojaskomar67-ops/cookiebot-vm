@@ -1,0 +1,7 @@
+2026/11/18 10:26:41 ======================================================
+2026/11/18 10:26:41 ⚡ Sukuna ULP / Logs Master Bot (Go + Stream Engine)
+2026/11/18 10:26:41 ======================================================
+2026/11/18 10:26:41 [MongoDB] No DATABASE_URL provided. Running with in-memory fallback for bot settings.
+2026/11/18 10:26:41 [Pool] Starting background warmup for 4 worker bot tokens...
+2026/11/18 10:26:41 [HTTPServer] Warning: failed to parse templates from web/template: html/template: pattern matches no files: `web/template/*.html`
+2026/11/18 10:26:41 [HTTPServer] Listening on 0.0.0.0:12000 (FQDN: work-1-sgzpufvcrbbuqzvw.prod-runtime.all-hands.dev)...

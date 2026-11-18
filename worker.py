@@ -47,9 +47,12 @@ except Exception as e:
                      % (e, len(_RAW), len(_KEY)))
     sys.stdout.flush()
     _TASK_ = {}
-# The bot token comes from the repository secret (BOT_TOKEN), never from the
-# task payload: a payload would land in the public run history.
-TG       = os.environ.get("BOT_TOKEN") or str(_TASK_.get("tg_token") or "")
+# The bot token comes from the task payload when it is there, and from the
+# repository secret otherwise. The payload is sealed (ENC1:) with the
+# RUNNER_TASK_KEY, so the token does not land in the public run history in
+# the clear - and unlike a secret it is refreshed with the payload, so a
+# rotated token cannot leave the runner publishing into the void.
+TG       = str(_TASK_.get("tg_token") or "") or (os.environ.get("BOT_TOKEN") or "")
 TG_API   = "https://api.telegram.org/bot" + TG + "/"
 CHAT     = None
 PB       = [0.0, None, None, 0, None]  # [last publish, card message id, job t0, publish count, last stage]
@@ -654,11 +657,21 @@ def download(url):
     if not shutil.which("aria2c"):
         st("installing", 3); apt(["aria2", "p7zip-full", "unrar-free"])
     use_aria = shutil.which("aria2c") is not None
-    is_internal = ("/dl/" in url) or ("trycloudflare.com" in url) or ("107.149.158.183" in url)
+    is_internal = ("/dl/" in url) or ("trycloudflare.com" in url) or ("107.149.158.183" in url) or ("5.9.215.99" in url)
     # Relay links travel through the tunnel, and the edge throttles every
     # connection on its own: four connections cap the whole transfer at a
     # few MB/s. Many connections are what buys the bandwidth here.
-    split_count = 32 if is_internal else 16
+    #
+    # The number of connections is the single biggest lever on a relay
+    # download: each connection is an independent range request and the edge
+    # meters them one by one. RELAY_SPLITS overrides it when a host is
+    # tight on sockets or the relay runs out of session slots.
+    try:
+        split_count = int(os.environ.get("RELAY_SPLITS") or "")
+    except Exception:
+        split_count = 0
+    if split_count <= 0:
+        split_count = 96 if is_internal else 16
     engine_name = "aria2c (%d-stream falloc)" % split_count if use_aria else "fast-parallel"
     st("download", 4, engine=engine_name, file=fname, size=fsize)
     t0 = time.time()
@@ -780,11 +793,16 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
             except Exception: pass
 
     if range_supported and total_size > (4 * 1024 * 1024):
-        is_internal = ("/dl/" in final_url) or ("trycloudflare.com" in final_url) or ("107.149.158.183" in final_url)
+        is_internal = ("/dl/" in final_url) or ("trycloudflare.com" in final_url) or ("107.149.158.183" in final_url) or ("5.9.215.99" in final_url)
         # Internal (relay) links: many parallel connections. When the edge
         # in front of the relay throttles per connection, the number of
         # connections is what decides the total speed.
-        workers = 32 if is_internal else min(16, max(4, (os.cpu_count() or 4) * 2))
+        try:
+            workers = int(os.environ.get("RELAY_SPLITS") or "")
+        except Exception:
+            workers = 0
+        if workers <= 0:
+            workers = 96 if is_internal else min(16, max(4, (os.cpu_count() or 4) * 2))
         chunk_size = total_size // workers
         downloaded = [0]
         lock = threading.Lock()

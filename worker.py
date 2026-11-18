@@ -806,19 +806,44 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
         is_internal = ("/dl/" in final_url) or ("trycloudflare.com" in final_url) or ("107.149.158.183" in final_url) or ("5.9.215.99" in final_url)
         # Internal (relay) links: many parallel connections. When the edge
         # in front of the relay throttles per connection, the number of
-        # connections is what decides the total speed.
+        # connections is what decides the total speed. The edge also caps
+        # how many connections it will carry at once, so the total (files
+        # in parallel x connections per file) has to stay below that.
         try:
             workers = int(os.environ.get("RELAY_SPLITS") or "")
         except Exception:
             workers = 0
         if workers <= 0:
             workers = 32 if is_internal else min(16, max(4, (os.cpu_count() or 4) * 2))
-        chunk_size = total_size // workers
+        # The segment size is independent of the number of connections.
+        #
+        # One segment per connection makes the segment as large as
+        # file/connections, and with several files pulling at once every
+        # connection only gets a fraction of the relay's capacity - so the
+        # segment takes so long that it outlives the socket timeout and is
+        # fetched again and again. Small segments finish long before that,
+        # while the number of open connections stays where it should be.
+        try:
+            seg_mb = int(os.environ.get("RELAY_SEGMENT_MB") or "")
+        except Exception:
+            seg_mb = 0
+        if seg_mb <= 0:
+            seg_mb = 8 if is_internal else 32
+        seg_size = seg_mb * 1024 * 1024
         downloaded = [0]
         lock = threading.Lock()
         last_tick = [time.time()]
 
-        def worker_fetch(w_idx, start, end):
+        # The segments every connection works through, in order.
+        seg_queue = queue.Queue()
+        off = 0
+        while off < total_size:
+            seg_end = min(off + seg_size, total_size) - 1
+            seg_queue.put((off, seg_end))
+            off = seg_end + 1
+        seg_total = seg_queue.qsize()
+
+        def fetch_segment(w_idx, start, end):
             """Fetch one segment, resuming from where it stopped.
 
             A segment that ends early must never be silently accepted: the
@@ -841,7 +866,7 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
                         'Range': f'bytes={curr}-{end}',
                         'Accept': '*/*'
                     })
-                    with urllib.request.urlopen(w_req, timeout=300) as r:
+                    with urllib.request.urlopen(w_req, timeout=180) as r:
                         while curr <= end:
                             if stop(): return False
                             chunk = r.read(1024 * 1024)
@@ -873,12 +898,20 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
                 time.sleep(min(0.5 * attempts, 5))
             return curr > end
 
+        def worker_loop(w_idx):
+            """One connection works through the segments until they are gone."""
+            bad = 0
+            while True:
+                try:
+                    start, end = seg_queue.get_nowait()
+                except queue.Empty:
+                    return bad == 0
+                if not fetch_segment(w_idx, start, end):
+                    bad += 1
+                seg_queue.task_done()
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = []
-            for i in range(workers):
-                st_pos = i * chunk_size
-                en_pos = total_size - 1 if i == workers - 1 else (i + 1) * chunk_size - 1
-                futs.append(ex.submit(worker_fetch, i, st_pos, en_pos))
+            futs = [ex.submit(worker_loop, i) for i in range(workers)]
             incomplete = []
             for f in concurrent.futures.as_completed(futs):
                 if stop():
@@ -892,9 +925,9 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
                 # The file is the right size on disk but parts of it were
                 # never written. Scanning it would report panels that are
                 # simply not in the dump, so the download is a failure.
-                sys.stdout.write("INCOMPLETE DOWNLOAD: %d of %d segments did not "
-                                 "finish (%d of %d bytes written)\n"
-                                 % (len(incomplete), workers, downloaded[0], total_size))
+                sys.stdout.write("INCOMPLETE DOWNLOAD: %d of %d connections did not "
+                                 "finish (%d of %d bytes written, %d segments)\n"
+                                 % (len(incomplete), workers, downloaded[0], total_size, seg_total))
                 sys.stdout.flush()
                 os.close(fd)
                 return None

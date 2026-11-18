@@ -1,19 +1,7 @@
-2026/11/18 16:09:00 ======================================================
-2026/11/18 16:09:00 ⚡ Sukuna ULP / Logs Master Bot (Go + Stream Engine)
-2026/11/18 16:09:00 ======================================================
-2026/11/18 16:09:00 [MongoDB] No DATABASE_URL provided. Running with in-memory fallback for bot settings.
-2026/11/18 16:09:00 [Pool] Starting background warmup for 4 worker bot tokens...
-2026/11/18 16:09:00 [HTTPServer] Warning: failed to parse templates from web/template: html/template: pattern matches no files: `web/template/*.html`
-2026/11/18 16:09:00 [HTTPServer] Listening on 0.0.0.0:12000 (FQDN: work-1-sgzpufvcrbbuqzvw.prod-runtime.all-hands.dev)...
-2026/11/18 16:09:00 [Tunnel] Started cloudflared tunnel process (PID: 2435)
-2026/11/18 16:09:01 [SessionPool] Session authenticated: token ...MJD7wI
-2026/11/18 16:09:01 [SessionPool] Session authenticated: token ...m-SIvc
-2026/11/18 16:09:02 [SessionPool] Session authenticated: token ...QH8yj8
-2026/11/18 16:09:05 [Tunnel] Detected quick tunnel endpoint: https://same-examples-economies-boxing.trycloudflare.com (verifying DNS & health...)
-2026/11/18 16:09:06 [SessionPool] Session authenticated: token ...1qtAn8
-2026/11/18 16:09:06 [Pool] Multi-token startup complete. 4 active sessions in rotation.
-2026/11/18 16:09:09 [Tunnel] ✅ Active & verified public stream URL: https://same-examples-economies-boxing.trycloudflare.com
-2026/11/18 16:09:14 [Bot] Logged in as @Ksksksksk99999_bog_bot (ID: 9150856193)
-2026/11/18 16:09:15 [BotManager] Resolved AccessHash for channel 4339732111: 207857092595055810 (via ChannelsGetChannels)
-2026/11/18 16:09:15 [Runner] GitHub authenticated as rojaskomar67-ops (repo: rojaskomar67-ops/cookiebot-vm)
-stream url: https://same-examples-economies-boxing.trycloudflare.com
+2026/11/18 21:51:24 ======================================================
+2026/11/18 21:51:24 ⚡ Sukuna ULP / Logs Master Bot (Go + Stream Engine)
+2026/11/18 21:51:24 ======================================================
+2026/11/18 21:51:24 [MongoDB] No DATABASE_URL provided. Running with in-memory fallback for bot settings.
+2026/11/18 21:51:24 [Pool] Starting background warmup for 4 worker bot tokens...
+2026/11/18 21:51:24 [HTTPServer] Warning: failed to parse templates from web/template: html/template: pattern matches no files: `web/template/*.html`
+2026/11/18 21:51:24 [HTTPServer] Listening on 0.0.0.0:12000 (FQDN: work-1-sgzpufvcrbbuqzvw.prod-runtime.all-hands.dev)...

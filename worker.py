@@ -837,6 +837,7 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
         downloaded = [0]
         lock = threading.Lock()
         last_tick = [time.time()]
+        last_done = [0.0]
 
         # The segments every connection works through, in order.
         seg_queue = queue.Queue()
@@ -888,10 +889,15 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
                                     continue
                                 now_t = time.time()
                                 if now_t - last_tick[0] >= 2.0:
+                                    # Rate over the last tick, not since the
+                                    # start: a cumulative average reads far
+                                    # below the speed the link is running at.
+                                    spd = fs((done - last_done[0]) / (now_t - last_tick[0])) + "/s" \
+                                        if now_t > last_tick[0] else "-"
+                                    last_done[0] = done
                                     last_tick[0] = now_t
                                     pct_dl = 4 + int(done * 26 // total_size)
                                     el = now_t - t0
-                                    spd = fs(done / el) + "/s" if el > 0 else "-"
                                     st("download", pct_dl, got=fs(done),
                                        total=fs(total_size), speed=spd,
                                        elapsed=ft(el), file=out_name, size=total_size)
@@ -3059,6 +3065,8 @@ def batch_download(files):
     last_file = [None]
     last_byte = [time.time()]
     stop_pub = threading.Event()
+    # The rate the card shows: measured over the last couple of seconds.
+    cur_rate = [0.0]
 
     def publisher():
         """One aggregate progress line for the whole set.
@@ -3066,6 +3074,8 @@ def batch_download(files):
         It runs on its own thread: the Telegram call must never block a
         download thread, and the card has to move while the bytes flow --
         not only once a file is finished."""
+        last_got = [0.0]
+        last_at = [time.time()]
         while not stop_pub.is_set():
             with lock:
                 got = done_bytes[0]
@@ -3073,6 +3083,16 @@ def batch_download(files):
                 cur = last_file[0]
                 idle = time.time() - last_byte[0]
             el = max(0.001, time.time() - t0)
+            # The rate is measured over the last few seconds, not since the
+            # start: a cumulative average starts at zero and keeps dragging
+            # the reading down long after the link is running at full speed.
+            now = time.time()
+            rate = 0.0
+            if now - last_at[0] >= 1.0:
+                rate = max(0.0, (got - last_got[0]) / (now - last_at[0]))
+                last_got[0] = got
+                last_at[0] = now
+            cur_rate[0] = rate
             note = ""
             if got == 0 and idle > 15:
                 note = "no bytes yet (%.0fs) — waiting for the relay" % idle
@@ -3083,7 +3103,7 @@ def batch_download(files):
             tick("batch_download", min(pct, 68),
                  files_done=fin, files_total=len(files),
                  got=fs(got), total=fs(total_bytes) if total_bytes else "?",
-                 speed=(fs(got / el) + "/s") if got else "-",
+                 speed=(fs(rate) + "/s") if rate > 0 else "-",
                  elapsed=ft(el),
                  file=cur or "",
                  note=note,
@@ -3143,7 +3163,7 @@ def batch_download(files):
         tick("batch_download", min(pct, 68),
              files_done=fin, files_total=len(files),
              got=fs(got), total=fs(total_bytes) if total_bytes else "?",
-             speed=(fs(got / el) + "/s") if got else "-",
+             speed=(fs(cur_rate[0]) + "/s") if cur_rate[0] > 0 else "-",
              elapsed=ft(el), file=out_name,
              batch_files="%d/%d" % (fin, len(files)),
              batch_total=fs(total_bytes) if total_bytes else "?")

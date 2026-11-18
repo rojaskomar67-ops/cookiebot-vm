@@ -40,7 +40,12 @@ def _unseal(raw, key):
 
 try:
     _TASK_ = json.loads(_unseal(_RAW, _KEY) or "{}")
-except Exception:
+except Exception as e:
+    # Never swallow this: without the task the runner has nothing to do and
+    # the job would just sit there.
+    sys.stdout.write("task unseal failed: %s (raw=%d bytes, key=%d bytes)\n"
+                     % (e, len(_RAW), len(_KEY)))
+    sys.stdout.flush()
     _TASK_ = {}
 # The bot token comes from the repository secret (BOT_TOKEN), never from the
 # task payload: a payload would land in the public run history.

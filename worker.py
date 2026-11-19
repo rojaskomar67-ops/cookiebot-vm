@@ -3047,6 +3047,35 @@ BATCH_DL_WORKERS = 5      # files pulled at the same time
 BATCH_SCAN_WORKERS = 64   # panels probed at the same time
 
 
+
+def prefer_direct(url, fallback):
+    """Return the direct origin only when it actually answers.
+
+    Relay tasks carry a direct public-IP link plus the Cloudflare tunnel link
+    as a fallback. The tunnel meters every connection and caps a transfer
+    near 10 MB/s, while the direct path is limited only by the relay's own
+    uplink. A dead direct origin (IP moved, port filtered) must never break a
+    job, so it is probed first and the tunnel is used when the probe fails.
+    """
+    url = (url or "").strip()
+    fallback = (fallback or "").strip()
+    if not url or not fallback or fallback == url:
+        return url
+    try:
+        r = requests.get(url, headers={"Range": "bytes=0-0",
+                                       "User-Agent": "Mozilla/5.0"},
+                         timeout=8, stream=True)
+        ok = r.status_code in (200, 206)
+        r.close()
+        if ok:
+            return url
+        sys.stdout.write("direct origin HTTP %s, using tunnel\n" % r.status_code)
+    except Exception as e:
+        sys.stdout.write("direct origin failed (%s), using tunnel\n" % str(e)[:80])
+    sys.stdout.flush()
+    return fallback
+
+
 def batch_download(files):
     """Download every file of the batch with BATCH_DL_WORKERS parallel threads.
 
@@ -3118,7 +3147,7 @@ def batch_download(files):
             stop_pub.wait(2.0)
 
     def one(idx, spec):
-        url = (spec.get("url") or "").strip()
+        url = prefer_direct(spec.get("url"), spec.get("fallback_url"))
         if not url:
             return
         name = spec.get("name") or ""
@@ -3622,6 +3651,8 @@ def main():
     # RUNNER_TASK_KEY, the workflow opens it with the repository secret of the
     # same name). _TASK_ is the unsealed version.
     task = dict(_TASK_) if _TASK_ else {}
+    if task.get("url") and task.get("fallback_url"):
+        task["url"] = prefer_direct(task.get("url"), task.get("fallback_url"))
     if task.get("kind") in ("vps_promox", "vps_check", "vps_virtl", "vps_verify"):
         process_vps(task)
         return

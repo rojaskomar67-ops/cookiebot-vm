@@ -671,7 +671,13 @@ def download(url):
     except Exception:
         split_count = 0
     if split_count <= 0:
-        split_count = 32 if is_internal else 16
+        # The edge throttles every connection on its own, so the aggregate is
+        # roughly connections x per-connection rate. 32 was chosen while the
+        # relay still advertised a 64 KB TCP window and per-connection rate
+        # was tiny; after the host TCP buffers were raised the relay can feed
+        # more streams. 64 stays well below the edge's ~344-connection cap
+        # even with four files downloading at once.
+        split_count = 64 if is_internal else 16
     engine_name = "aria2c (%d-stream falloc)" % split_count if use_aria else "fast-parallel"
     st("download", 4, engine=engine_name, file=fname, size=fsize)
     t0 = time.time()
@@ -814,7 +820,7 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
         except Exception:
             workers = 0
         if workers <= 0:
-            workers = 32 if is_internal else min(16, max(4, (os.cpu_count() or 4) * 2))
+            workers = 64 if is_internal else min(16, max(4, (os.cpu_count() or 4) * 2))
         # The segment size is independent of the number of connections.
         #
         # One segment per connection (file_size / connections) is the fastest

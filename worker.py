@@ -3061,17 +3061,31 @@ def prefer_direct(url, fallback):
     fallback = (fallback or "").strip()
     if not url or not fallback or fallback == url:
         return url
-    try:
-        r = requests.get(url, headers={"Range": "bytes=0-0",
-                                       "User-Agent": "Mozilla/5.0"},
-                         timeout=8, stream=True)
-        ok = r.status_code in (200, 206)
-        r.close()
-        if ok:
-            return url
-        sys.stdout.write("direct origin HTTP %s, using tunnel\n" % r.status_code)
-    except Exception as e:
-        sys.stdout.write("direct origin failed (%s), using tunnel\n" % str(e)[:80])
+    # The relay's first chunk after a restart is slow: the MTProto
+    # connections are cold and every session resolves the document once, so
+    # one range request can take 10-20 s before the first byte arrives. A
+    # short probe would reject a healthy direct origin and send the whole job
+    # through the metered tunnel, so probe with patience and one retry. The
+    # range is 1 KiB because the relay answers it from the same first chunk a
+    # real download would fetch.
+    last = ""
+    for attempt in range(2):
+        try:
+            r = requests.get(url, headers={"Range": "bytes=0-1023",
+                                           "User-Agent": "Mozilla/5.0"},
+                             timeout=(10, 35), stream=True)
+            ok = r.status_code in (200, 206)
+            r.close()
+            if ok:
+                if attempt:
+                    sys.stdout.write("direct origin ok on retry\n")
+                return url
+            last = "HTTP %s" % r.status_code
+        except Exception as e:
+            last = str(e)[:80]
+        if attempt == 0:
+            time.sleep(2)
+    sys.stdout.write("direct origin failed (%s), using tunnel\n" % last)
     sys.stdout.flush()
     return fallback
 

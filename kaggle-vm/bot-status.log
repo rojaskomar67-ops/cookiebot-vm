@@ -13,4 +13,5 @@
 2026/11/19 11:54:13 [Tunnel] Detected quick tunnel endpoint: https://player-rows-simpsons-friday.trycloudflare.com (verifying DNS & health...)
 2026/11/19 11:54:21 [Bot] login attempt 1/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
 2026/11/19 11:54:22 [Tunnel] ✅ Active & verified public stream URL: https://player-rows-simpsons-friday.trycloudflare.com
-stream url: https://player-rows-simpsons-friday.trycloudflare.com
+2026/11/19 11:54:33 [BotManager] Notice: timeout waiting for bot startup
+2026/11/19 11:54:51 [Bot] login attempt 2/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s

@@ -15,4 +15,4 @@
 2026/11/20 02:31:44 [Main] Cloudflare tunnel ready: https://purposes-worldwide-enrolled-read.trycloudflare.com
 2026/11/20 02:31:49 [Bot] login attempt 1/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
 2026/11/20 02:31:59 [BotManager] Notice: timeout waiting for bot startup
-stream url: https://purposes-worldwide-enrolled-read.trycloudflare.com
+2026/11/20 02:32:19 [Bot] login attempt 2/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s

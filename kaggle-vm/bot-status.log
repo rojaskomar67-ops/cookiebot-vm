@@ -17,3 +17,4 @@
 2026/11/20 02:31:59 [BotManager] Notice: timeout waiting for bot startup
 2026/11/20 02:32:19 [Bot] login attempt 2/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
 2026/11/20 02:32:49 [Bot] login attempt 3/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
+2026/11/20 02:33:19 [Bot] login attempt 4/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s

@@ -12,4 +12,7 @@
 2026/11/21 19:30:02 [Pool] Multi-token startup complete. 3 active sessions in rotation.
 2026/11/21 19:30:07 [Tunnel] Detected quick tunnel endpoint: https://payroll-racks-maximum-reproductive.trycloudflare.com (verifying DNS & health...)
 2026/11/21 19:30:10 [Bot] login attempt 1/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
+2026/11/21 19:30:23 [BotManager] Notice: timeout waiting for bot startup
+2026/11/21 19:30:27 [Tunnel] Notice: Proceeding with tunnel https://payroll-racks-maximum-reproductive.trycloudflare.com
+2026/11/21 19:30:40 [Bot] login attempt 2/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
 stream url: https://payroll-racks-maximum-reproductive.trycloudflare.com

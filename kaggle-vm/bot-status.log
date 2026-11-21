@@ -15,4 +15,4 @@
 2026/11/21 11:26:05 [Main] Cloudflare tunnel ready: https://keys-caps-informal-cambridge.trycloudflare.com
 2026/11/21 11:26:08 [Bot] login attempt 1/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
 2026/11/21 11:26:20 [BotManager] Notice: timeout waiting for bot startup
-stream url: https://keys-caps-informal-cambridge.trycloudflare.com
+2026/11/21 11:26:38 [Bot] login attempt 2/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s

@@ -14,4 +14,5 @@
 2026/11/22 16:27:53 [Tunnel] ✅ Active & verified public stream URL: https://easier-firewire-explorer-roles.trycloudflare.com
 2026/11/22 16:27:53 [Main] Cloudflare tunnel ready: https://easier-firewire-explorer-roles.trycloudflare.com
 2026/11/22 16:27:56 [Bot] login attempt 1/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
-stream url: https://easier-firewire-explorer-roles.trycloudflare.com
+2026/11/22 16:28:08 [BotManager] Notice: timeout waiting for bot startup
+2026/11/22 16:28:26 [Bot] login attempt 2/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s

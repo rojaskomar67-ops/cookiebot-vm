@@ -758,6 +758,14 @@ def download(url):
        dl_time=ft(time.time() - t0))
     return Path(found)
 
+# How many files are being pulled at the same time right now. The connection
+# count of a relay download is per file, so the total in flight is
+# files x splits: that total has to stay inside both the edge's connection
+# cap and the relay's chunk-slot budget, otherwise the connections that do
+# get through end up waiting for a slot and the transfer stalls.
+_PARALLEL_FILES = 1
+
+
 def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
     """High-throughput multi-connection parallel segment downloader using atomic
     posix_fallocate + direct os.pwrite without seeking or locking races.
@@ -820,7 +828,18 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
         except Exception:
             workers = 0
         if workers <= 0:
-            workers = 96 if is_internal else min(16, max(4, (os.cpu_count() or 4) * 2))
+            if is_internal:
+                # 96 splits per file is the measured optimum for a relay link
+                # (32 gave 11.2 MB/s, 96 gave 15.5 MB/s through the tunnel).
+                # But the count is *per file*: five files at 96 splits is 480
+                # connections, past the edge's ~344-connection cap, and the
+                # relay only has so many chunk slots - a connection holds a
+                # slot while its chunk is written downstream. Divide the
+                # budget between the files that are in flight.
+                par = max(1, int(_PARALLEL_FILES))
+                workers = max(16, min(96, 128 // par))
+            else:
+                workers = min(16, max(4, (os.cpu_count() or 4) * 2))
         # The segment size is independent of the number of connections.
         #
         # One segment per connection (file_size / connections) is the fastest
@@ -3220,6 +3239,11 @@ def batch_download(files):
 
     pub = threading.Thread(target=publisher, daemon=True)
     pub.start()
+    # Tell the per-file downloader how many files share the connection
+    # budget, so "files x splits" stays inside the edge cap and the relay's
+    # chunk slots.
+    global _PARALLEL_FILES
+    _PARALLEL_FILES = max(1, min(len(files), BATCH_DL_WORKERS))
     try:
         with ThreadPoolExecutor(max_workers=BATCH_DL_WORKERS) as ex:
             futs = [ex.submit(one, i, spec) for i, spec in enumerate(files)]

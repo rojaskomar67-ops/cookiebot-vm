@@ -671,13 +671,28 @@ def download(url):
     except Exception:
         split_count = 0
     if split_count <= 0:
-        # The edge throttles every connection on its own, so the aggregate is
-        # roughly connections x per-connection rate. 32 was chosen while the
-        # relay still advertised a 64 KB TCP window and per-connection rate
-        # was tiny; after the host TCP buffers were raised the relay can feed
-        # more streams. 64 stays well below the edge's ~344-connection cap
-        # even with four files downloading at once.
-        split_count = 96 if is_internal else 16
+        # The split count is the single biggest lever on a relay download,
+        # and it is NOT "more is better". Measured on the production relay
+        # (direct origin, 12 accounts x 3 connections, 36 sessions, 100 MB
+        # over N parallel range requests):
+        #
+        #   N=1  28.5 MB/s (228 Mbps)
+        #   N=4  64.4 MB/s (515 Mbps)
+        #   N=8  70.0 MB/s (560 Mbps)   <- the peak
+        #   N=12 56.1 MB/s
+        #   N=16 45.1 MB/s
+        #   N=24 20.4 MB/s
+        #   N=32 31.9 MB/s
+        #   N=64 21.9 MB/s
+        #
+        # Past ~8 connections the relay stops scaling and then goes
+        # backwards: every connection holds a chunk slot while its chunk is
+        # written downstream, the per-request streams collide with the
+        # session request cap, and head-of-line blocking inside each request
+        # starts stalling the others. The old default of 96 splits sat deep
+        # in the collapse - it was tuned when the Cloudflare tunnel was the
+        # bottleneck and one connection was pathologically slow.
+        split_count = 8 if is_internal else 16
     engine_name = "aria2c (%d-stream falloc)" % split_count if use_aria else "fast-parallel"
     st("download", 4, engine=engine_name, file=fname, size=fsize)
     t0 = time.time()
@@ -765,6 +780,12 @@ def download(url):
 # get through end up waiting for a slot and the transfer stalls.
 _PARALLEL_FILES = 1
 
+# Total number of concurrent range requests a relay download may have open.
+# Measured on the production relay: 4 connections give 64 MB/s, 8 give
+# 70 MB/s, 12 give 56, 16 give 45 and 24 collapse to 20 MB/s. Eight is the
+# peak; everything above it costs throughput instead of buying it.
+_RELAY_CONN_BUDGET = 8
+
 
 def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
     """High-throughput multi-connection parallel segment downloader using atomic
@@ -829,15 +850,14 @@ def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
             workers = 0
         if workers <= 0:
             if is_internal:
-                # 96 splits per file is the measured optimum for a relay link
-                # (32 gave 11.2 MB/s, 96 gave 15.5 MB/s through the tunnel).
-                # But the count is *per file*: five files at 96 splits is 480
-                # connections, past the edge's ~344-connection cap, and the
-                # relay only has so many chunk slots - a connection holds a
-                # slot while its chunk is written downstream. Divide the
-                # budget between the files that are in flight.
+                # The connection count is a *total* budget, not a per-file
+                # one: the relay's peak throughput is at ~8 concurrent range
+                # requests in total (see the measurement above), and it
+                # degrades sharply beyond that. Five files at 96 splits each
+                # is 480 connections in the worst case - deep in the
+                # collapse. Divide the budget between the files in flight.
                 par = max(1, int(_PARALLEL_FILES))
-                workers = max(16, min(96, 128 // par))
+                workers = max(2, _RELAY_CONN_BUDGET // par)
             else:
                 workers = min(16, max(4, (os.cpu_count() or 4) * 2))
         # The segment size is independent of the number of connections.

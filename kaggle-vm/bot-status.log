@@ -14,4 +14,5 @@
 2026/11/24 23:07:46 [Tunnel] ✅ Active & verified public stream URL: https://suited-creek-cluster-seemed.trycloudflare.com
 2026/11/24 23:07:46 [Main] Cloudflare tunnel ready: https://suited-creek-cluster-seemed.trycloudflare.com
 2026/11/24 23:07:52 [Bot] login attempt 1/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
-stream url: https://suited-creek-cluster-seemed.trycloudflare.com
+2026/11/24 23:08:01 [BotManager] Notice: timeout waiting for bot startup
+2026/11/24 23:08:22 [Bot] login attempt 2/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s

@@ -14,4 +14,5 @@
 2026/11/24 02:22:45 [Tunnel] ✅ Active & verified public stream URL: https://assembled-achieving-brilliant-hopefully.trycloudflare.com
 2026/11/24 02:22:45 [Main] Cloudflare tunnel ready: https://assembled-achieving-brilliant-hopefully.trycloudflare.com
 2026/11/24 02:22:49 [Bot] login attempt 1/6 failed: rpcDoRequest: rpc error code 500: RPC_CALL_FAIL - retrying in 30s
-stream url: https://assembled-achieving-brilliant-hopefully.trycloudflare.com
+2026/11/24 02:23:00 [BotManager] Notice: timeout waiting for bot startup
+2026/11/24 02:23:19 [Bot] login attempt 2/6 failed: rpcDoRequest: rpc error code 500: RPC_CALL_FAIL - retrying in 30s

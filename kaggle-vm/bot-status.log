@@ -5,3 +5,13 @@
 2026/11/24 02:22:37 [Pool] Starting background warmup for 4 worker bot tokens...
 2026/11/24 02:22:37 [HTTPServer] Warning: failed to parse templates from web/template: html/template: pattern matches no files: `web/template/*.html`
 2026/11/24 02:22:37 [HTTPServer] Listening on 0.0.0.0:12000 (FQDN: work-1-sgzpufvcrbbuqzvw.prod-runtime.all-hands.dev)...
+2026/11/24 02:22:38 [Tunnel] Started cloudflared tunnel process (PID: 2442)
+2026/11/24 02:22:39 [SessionPool] Session authenticated: token ...m-SIvc
+2026/11/24 02:22:39 [SessionPool] Session authenticated: token ...MJD7wI
+2026/11/24 02:22:40 [SessionPool] Session authenticated: token ...QH8yj8
+2026/11/24 02:22:40 [Pool] Multi-token startup complete. 3 active sessions in rotation.
+2026/11/24 02:22:44 [Tunnel] Detected quick tunnel endpoint: https://assembled-achieving-brilliant-hopefully.trycloudflare.com (verifying DNS & health...)
+2026/11/24 02:22:45 [Tunnel] ✅ Active & verified public stream URL: https://assembled-achieving-brilliant-hopefully.trycloudflare.com
+2026/11/24 02:22:45 [Main] Cloudflare tunnel ready: https://assembled-achieving-brilliant-hopefully.trycloudflare.com
+2026/11/24 02:22:49 [Bot] login attempt 1/6 failed: rpcDoRequest: rpc error code 500: RPC_CALL_FAIL - retrying in 30s
+stream url: https://assembled-achieving-brilliant-hopefully.trycloudflare.com

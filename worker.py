@@ -2237,18 +2237,13 @@ def pack_secrets(files):
 def finish(task, stage, **extra):
     """Terminal state for a job: paint the card, report to the bot, back to idle."""
     if stage == "done":
-        # 1. Delete the live console card message immediately
+        # 1. The live console card stays in the chat. It used to be deleted
+        #    here, so the whole run vanished the instant it finished. The card
+        #    keeps the final console state (painted below by st()) and the
+        #    summary goes out as its own message.
         if CHAT and PB[1]:
-            try:
-                r = tg_post(TG_API + "deleteMessage", tries=3, timeout=10, json={
-                    "chat_id": CHAT, "message_id": PB[1]
-                })
-                sys.stdout.write("Live card %s deleted, rc=%s\n" % (PB[1], r.status_code))
-                sys.stdout.flush()
-            except Exception as e:
-                sys.stdout.write("Delete live card err: %s\n" % e)
-                sys.stdout.flush()
-            PB[1] = None
+            sys.stdout.write("Live card %s kept in chat\n" % (PB[1],))
+            sys.stdout.flush()
 
         # 2. Send Task Complete ✅
         if CHAT:

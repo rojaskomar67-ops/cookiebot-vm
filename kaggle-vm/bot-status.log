@@ -5,3 +5,13 @@
 2026/11/25 05:31:14 [Pool] Starting background warmup for 4 worker bot tokens...
 2026/11/25 05:31:14 [HTTPServer] Warning: failed to parse templates from web/template: html/template: pattern matches no files: `web/template/*.html`
 2026/11/25 05:31:14 [HTTPServer] Listening on 0.0.0.0:12000 (FQDN: work-1-sgzpufvcrbbuqzvw.prod-runtime.all-hands.dev)...
+2026/11/25 05:31:14 [Tunnel] Started cloudflared tunnel process (PID: 2226)
+2026/11/25 05:31:15 [SessionPool] Session authenticated: token ...MJD7wI
+2026/11/25 05:31:15 [SessionPool] Session authenticated: token ...m-SIvc
+2026/11/25 05:31:16 [SessionPool] Session authenticated: token ...QH8yj8
+2026/11/25 05:31:18 [Tunnel] Detected quick tunnel endpoint: https://pointer-printer-oct-views.trycloudflare.com (verifying DNS & health...)
+2026/11/25 05:31:20 [Tunnel] ✅ Active & verified public stream URL: https://pointer-printer-oct-views.trycloudflare.com
+2026/11/25 05:31:20 [Main] Cloudflare tunnel ready: https://pointer-printer-oct-views.trycloudflare.com
+2026/11/25 05:31:21 [Pool] Multi-token startup complete. 3 active sessions in rotation.
+2026/11/25 05:31:35 [BotManager] Notice: timeout waiting for bot startup
+stream url: https://pointer-printer-oct-views.trycloudflare.com

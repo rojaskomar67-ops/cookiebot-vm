@@ -17,3 +17,4 @@
 2026/11/25 05:31:38 [Bot] login attempt 1/6 failed: migrate to dc: context deadline exceeded - retrying in 30s
 2026/11/25 05:32:08 [Bot] login attempt 2/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
 2026/11/25 05:32:38 [Bot] login attempt 3/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
+2026/11/25 05:33:08 [Bot] login attempt 4/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s

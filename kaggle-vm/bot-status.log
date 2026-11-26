@@ -1,22 +1,7 @@
-2026/11/26 11:07:03 ======================================================
-2026/11/26 11:07:03 ⚡ Sukuna ULP / Logs Master Bot (Go + Stream Engine)
-2026/11/26 11:07:03 ======================================================
-2026/11/26 11:07:03 [MongoDB] No DATABASE_URL provided. Running with in-memory fallback for bot settings.
-2026/11/26 11:07:03 [Pool] Starting background warmup for 4 worker bot tokens...
-2026/11/26 11:07:03 [HTTPServer] Warning: failed to parse templates from web/template: html/template: pattern matches no files: `web/template/*.html`
-2026/11/26 11:07:03 [HTTPServer] Listening on 0.0.0.0:12000 (FQDN: work-1-sgzpufvcrbbuqzvw.prod-runtime.all-hands.dev)...
-2026/11/26 11:07:04 [Tunnel] Started cloudflared tunnel process (PID: 2420)
-2026/11/26 11:07:04 [SessionPool] Session authenticated: token ...MJD7wI
-2026/11/26 11:07:04 [SessionPool] Session authenticated: token ...m-SIvc
-2026/11/26 11:07:05 [SessionPool] Session authenticated: token ...QH8yj8
-2026/11/26 11:07:06 [Tunnel] Detected quick tunnel endpoint: https://passive-tennessee-channels-competition.trycloudflare.com (verifying DNS & health...)
-2026/11/26 11:07:09 [Pool] Multi-token startup complete. 3 active sessions in rotation.
-2026/11/26 11:07:11 [Tunnel] ✅ Active & verified public stream URL: https://passive-tennessee-channels-competition.trycloudflare.com
-2026/11/26 11:07:11 [Main] Cloudflare tunnel ready: https://passive-tennessee-channels-competition.trycloudflare.com
-2026/11/26 11:07:16 [Bot] login attempt 1/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
-2026/11/26 11:07:26 [BotManager] Notice: timeout waiting for bot startup
-2026/11/26 11:07:47 [Bot] login attempt 2/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
-2026/11/26 11:08:17 [Bot] login attempt 3/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
-2026/11/26 11:08:47 [Bot] login attempt 4/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
-2026/11/26 11:09:17 [Bot] login attempt 5/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
-2026/11/26 11:09:48 [Bot] login attempt 6/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
+2026/11/26 20:17:40 ======================================================
+2026/11/26 20:17:40 ⚡ Sukuna ULP / Logs Master Bot (Go + Stream Engine)
+2026/11/26 20:17:40 ======================================================
+2026/11/26 20:17:40 [MongoDB] No DATABASE_URL provided. Running with in-memory fallback for bot settings.
+2026/11/26 20:17:40 [Pool] Starting background warmup for 4 worker bot tokens...
+2026/11/26 20:17:40 [HTTPServer] Warning: failed to parse templates from web/template: html/template: pattern matches no files: `web/template/*.html`
+2026/11/26 20:17:40 [HTTPServer] Listening on 0.0.0.0:12000 (FQDN: work-1-sgzpufvcrbbuqzvw.prod-runtime.all-hands.dev)...

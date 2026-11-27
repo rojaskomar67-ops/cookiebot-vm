@@ -13,4 +13,4 @@
 2026/11/27 22:08:26 [Pool] Multi-token startup complete. 3 active sessions in rotation.
 2026/11/27 22:08:32 [Tunnel] ✅ Active & verified public stream URL: https://forge-scheduling-alias-monthly.trycloudflare.com
 2026/11/27 22:08:34 [Bot] login attempt 1/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
-stream url: https://forge-scheduling-alias-monthly.trycloudflare.com
+2026/11/27 22:08:43 [BotManager] Notice: timeout waiting for bot startup

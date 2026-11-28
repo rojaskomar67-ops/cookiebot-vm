@@ -14,4 +14,4 @@
 2026/11/28 04:00:11 [Tunnel] ✅ Active & verified public stream URL: https://latin-fifty-tobago-learning.trycloudflare.com
 2026/11/28 04:00:11 [Main] Cloudflare tunnel ready: https://latin-fifty-tobago-learning.trycloudflare.com
 2026/11/28 04:00:17 [Bot] login attempt 1/6 failed: rpcDoRequest: rpc error code 400: ACCESS_TOKEN_EXPIRED - retrying in 30s
-stream url: https://latin-fifty-tobago-learning.trycloudflare.com
+2026/11/28 04:00:26 [BotManager] Notice: timeout waiting for bot startup
